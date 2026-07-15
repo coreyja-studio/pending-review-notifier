@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users\n                 SET access_token_enc = $1, refresh_token_enc = $2, token_expires_at = $3\n                 WHERE user_id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e2a98d16e8e14979009079756402f8622010b88b1684bdf2013059604d163e58"
+}

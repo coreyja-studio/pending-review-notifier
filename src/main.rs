@@ -8,8 +8,11 @@ use cja::{
 use tokio::task::JoinError;
 
 mod cron;
+mod crypto;
+mod github;
 mod jobs;
 mod routes;
+mod session;
 mod state;
 
 use state::AppState;

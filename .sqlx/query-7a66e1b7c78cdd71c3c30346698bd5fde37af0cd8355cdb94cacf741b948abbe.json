@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO users (\n            github_login, github_user_id, access_token_enc, refresh_token_enc,\n            token_expires_at, email, timezone\n        )\n        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::text, 'UTC'))\n        ON CONFLICT (github_user_id) DO UPDATE SET\n            github_login = EXCLUDED.github_login,\n            email = EXCLUDED.email,\n            access_token_enc = EXCLUDED.access_token_enc,\n            refresh_token_enc = EXCLUDED.refresh_token_enc,\n            token_expires_at = EXCLUDED.token_expires_at,\n            timezone = CASE\n                WHEN users.timezone = 'UTC' THEN COALESCE($7::text, users.timezone)\n                ELSE users.timezone\n            END,\n            status = CASE\n                WHEN users.status = 'needs_reauth' THEN 'active'\n                ELSE users.status\n            END\n        RETURNING user_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Bytea",
+        "Bytea",
+        "Timestamptz",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7a66e1b7c78cdd71c3c30346698bd5fde37af0cd8355cdb94cacf741b948abbe"
+}

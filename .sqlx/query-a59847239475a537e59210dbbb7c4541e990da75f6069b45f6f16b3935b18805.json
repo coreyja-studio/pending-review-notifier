@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT account_login, repository_selection\n         FROM installations WHERE user_id = $1\n         ORDER BY account_login",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_login",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_selection",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "a59847239475a537e59210dbbb7c4541e990da75f6069b45f6f16b3935b18805"
+}

@@ -1,13 +1,41 @@
-use axum::{Router, extract::State, routing::get};
-use cja::app_state::AppState as _;
-use maud::{DOCTYPE, Markup, html};
+use axum::{
+    Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse as _, Redirect, Response},
+    routing::{get, post},
+};
+use cja::{
+    app_state::AppState as _,
+    server::{
+        cookies::{Cookie, CookieJar},
+        session::Session,
+    },
+};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use crate::state::AppState;
+use crate::{
+    github,
+    session::{CurrentUser, PrnSession},
+    state::AppState,
+};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(landing))
         .route("/healthz", get(healthz))
+        .route("/login", get(github::oauth::login))
+        .route("/callback", get(github::oauth::callback))
+        .route("/logout", post(logout))
+        .route("/disconnect", post(disconnect))
+        .route("/dashboard", get(dashboard))
+}
+
+/// Log the error and return an opaque 500. Never include token material in
+/// errors passed here (sqlx/reqwest errors don't carry bind values or bodies).
+fn internal_error<E: std::fmt::Debug>(err: E) -> Response {
+    tracing::error!(?err, "Request failed");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 async fn healthz(State(state): State<AppState>) -> String {
@@ -35,11 +63,134 @@ async fn landing() -> Markup {
                 p {
                     a href="https://github.com/apps/pending-review-notifier" { "Install" }
                     " · "
-                    a href="/login" { "Sign in" }
+                    a id="login-link" href="/login" { "Sign in" }
+                }
+                // Capture the browser timezone at signup: rewrite the sign-in
+                // link so /login can stash the tz in the OAuth state cookie.
+                script {
+                    (PreEscaped(r#"
+                    document.addEventListener('DOMContentLoaded', function () {
+                        try {
+                            var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                            var link = document.getElementById('login-link');
+                            if (tz && link) {
+                                link.href = '/login?tz=' + encodeURIComponent(tz);
+                            }
+                        } catch (e) { /* default of UTC applies */ }
+                    });
+                    "#))
                 }
             }
         }
     }
+}
+
+async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, Response> {
+    let installations = sqlx::query!(
+        "SELECT account_login, repository_selection
+         FROM installations WHERE user_id = $1
+         ORDER BY account_login",
+        user.user_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Dashboard — Pending Review Notifier" }
+            }
+            body {
+                h1 { "Dashboard" }
+                p { "Signed in as " strong { (user.github_login) } "." }
+
+                h2 { "Covered installations" }
+                @if installations.is_empty() {
+                    p { "No installations yet — install the app to get coverage." }
+                } @else {
+                    ul {
+                        @for installation in &installations {
+                            li {
+                                (installation.account_login)
+                                " (" (installation.repository_selection) " repositories)"
+                            }
+                        }
+                    }
+                }
+                p { a href=(github::INSTALL_URL) { "Add more repos" } }
+
+                form method="post" action="/logout" {
+                    button type="submit" { "Log out" }
+                }
+                form method="post" action="/disconnect"
+                    onsubmit="return confirm('Disconnect from GitHub and delete all your data? This cannot be undone.')" {
+                    button type="submit" { "Disconnect" }
+                }
+            }
+        }
+    })
+}
+
+/// `POST /logout` — detach the user from the session (the anonymous session
+/// and its cookie live on).
+async fn logout(
+    State(state): State<AppState>,
+    Session(session): Session<PrnSession>,
+) -> Result<Redirect, Response> {
+    session
+        .clear_user(&state.db)
+        .await
+        .map_err(internal_error)?;
+    Ok(Redirect::to("/"))
+}
+
+/// `POST /disconnect` — revoke the grant at GitHub, delete the user (cascades
+/// installations, pending reviews, and session mappings), destroy the session.
+async fn disconnect(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    jar: CookieJar<AppState>,
+) -> Result<Redirect, Response> {
+    let row = sqlx::query!(
+        "SELECT access_token_enc FROM users WHERE user_id = $1",
+        user.user_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    // Best-effort revocation: local deletion must not be blockable by GitHub
+    // flakiness. 404/422 already count as success inside revoke_grant.
+    match state.crypto.decrypt(&row.access_token_enc) {
+        Ok(access_token) => {
+            if let Err(err) = github::revoke_grant(&state, &access_token).await {
+                tracing::error!(?err, "Grant revocation failed; deleting local data anyway");
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "Could not decrypt access token for revocation; deleting local data anyway"
+            );
+        }
+    }
+
+    sqlx::query!("DELETE FROM users WHERE user_id = $1", user.user_id)
+        .execute(&state.db)
+        .await
+        .map_err(internal_error)?;
+
+    user.session
+        .destroy(&state.db)
+        .await
+        .map_err(internal_error)?;
+    jar.remove(Cookie::build(("session_id", "")).path("/").build());
+
+    Ok(Redirect::to("/"))
 }
 
 #[cfg(test)]
@@ -48,35 +199,20 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use cja::server::cookies::CookieKey;
-    use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::state::AppConfig;
+    use crate::state::test_support::lazy_test_state;
 
-    /// AppState for router tests. The pool is created lazily and never
-    /// actually connects — none of the routes under test touch the DB.
-    fn test_state() -> AppState {
-        let db = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/prn_test_never_connected")
-            .expect("lazy pool creation should not require a running database");
-
-        AppState {
-            db,
-            cookie_key: CookieKey::generate(),
-            config: AppConfig {
-                github_client_id: "test-client-id".to_string(),
-                github_client_secret: "test-client-secret".to_string(),
-                token_enc_key: "test-key".to_string(),
-                base_url: "http://localhost:3000".to_string(),
-            },
-        }
+    fn test_app(state: &AppState) -> Router {
+        routes()
+            .with_state(state.clone())
+            .layer(tower_cookies::CookieManagerLayer::new())
     }
 
     #[tokio::test]
     async fn healthz_returns_200_with_version() {
-        let app = routes().with_state(test_state());
+        let app = test_app(&lazy_test_state());
 
         let response = app
             .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
@@ -93,8 +229,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn landing_returns_200() {
-        let app = routes().with_state(test_state());
+    async fn landing_returns_200_and_captures_tz() {
+        let app = test_app(&lazy_test_state());
 
         let response = app
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -102,5 +238,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("login-link"));
+        assert!(body.contains("Intl.DateTimeFormat().resolvedOptions().timeZone"));
     }
 }

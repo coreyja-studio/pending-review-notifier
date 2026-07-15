@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO user_sessions (session_id, user_id) VALUES ($1, $2)\n             ON CONFLICT (session_id) DO UPDATE SET user_id = EXCLUDED.user_id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "da5902422a5a2528cdb9347914db4216a4a305d2b81242aa656a548a8b26be96"
+}

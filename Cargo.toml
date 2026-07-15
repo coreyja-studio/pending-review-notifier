@@ -32,5 +32,12 @@ reqwest = { version = "0.12", default-features = false, features = [
   "json",
 ] }
 
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+tower-cookies = { version = "0.11", features = ["signed", "private"] }
+url = "2"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
