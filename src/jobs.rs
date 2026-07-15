@@ -4,10 +4,11 @@ use crate::state::AppState;
 
 /// Placeholder job so the job registry has at least one entry.
 ///
-/// IMPORTANT cja gotcha for future jobs: errors returned from job/cron
-/// closures propagate up and can crash the whole app. Real jobs (SyncUser,
-/// SendDigest, ...) must wrap their bodies to log errors and return `Ok`
-/// at the top level instead of bubbling failures with `?`.
+/// Note on error handling: errors returned from `Job::run` are caught by
+/// cja's job worker — the job is retried with exponential backoff and
+/// dead-lettered after max retries; they do NOT crash the app. The gotcha
+/// to watch is cron *closures* (see src/cron.rs), whose errors do propagate
+/// and crash the whole app.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NoopJob;
 

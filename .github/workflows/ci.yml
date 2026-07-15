@@ -34,6 +34,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt, clippy
+          # Swatinem/rust-cache below handles caching
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
 
@@ -41,7 +43,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features postgres,rustls --locked
+        run: cargo install sqlx-cli --version "^0.8" --no-default-features --features postgres,rustls --locked
 
       - name: Set up database
         run: |
@@ -66,6 +68,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only
+      # --ha=false: a second machine would run a duplicate cron worker and
+      # double-enqueue jobs (cja's cron tick is not guarded against races).
+      - run: flyctl deploy --remote-only --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

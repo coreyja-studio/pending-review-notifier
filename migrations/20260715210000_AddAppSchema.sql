@@ -11,10 +11,9 @@ CREATE TABLE users (
   email TEXT NOT NULL,
   -- IANA, browser-detected at signup
   timezone TEXT NOT NULL DEFAULT 'UTC',
-  digest_hour INT NOT NULL DEFAULT 9,
-  threshold_hours INT NOT NULL DEFAULT 4,
-  -- active | needs_reauth | paused
-  status TEXT NOT NULL DEFAULT 'active',
+  digest_hour INT NOT NULL DEFAULT 9 CHECK (digest_hour BETWEEN 0 AND 23),
+  threshold_hours INT NOT NULL DEFAULT 4 CHECK (threshold_hours > 0),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'needs_reauth', 'paused')),
   -- "email once" on refresh failure
   reauth_notified_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -23,7 +22,7 @@ CREATE TABLE users (
 CREATE TABLE installations (
   installation_id BIGINT PRIMARY KEY,
   account_login TEXT NOT NULL,
-  user_id UUID REFERENCES users (user_id),
+  user_id UUID REFERENCES users (user_id) ON DELETE CASCADE,
   -- all | selected
   repository_selection TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -36,7 +35,7 @@ CREATE TABLE pending_reviews (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   -- GraphQL node id
   review_id TEXT NOT NULL,
-  user_id UUID NOT NULL REFERENCES users (user_id),
+  user_id UUID NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
   pr_url TEXT NOT NULL,
   pr_title TEXT NOT NULL,
   repo_name_with_owner TEXT NOT NULL,
