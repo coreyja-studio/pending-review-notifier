@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET token_expires_at = now() - interval '1 hour'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "6056ee7ac3f788a35f4f213bc1c2c91dc6f7ce3163c46a3a18eb4886fe534a85"
+}

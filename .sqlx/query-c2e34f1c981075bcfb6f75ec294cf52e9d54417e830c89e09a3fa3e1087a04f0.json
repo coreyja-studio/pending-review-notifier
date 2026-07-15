@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO user_sessions (session_id, user_id, csrf_token)\n             VALUES ($1, $2, $3)\n             ON CONFLICT (session_id) DO UPDATE SET\n                user_id = EXCLUDED.user_id,\n                csrf_token = EXCLUDED.csrf_token,\n                created_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c2e34f1c981075bcfb6f75ec294cf52e9d54417e830c89e09a3fa3e1087a04f0"
+}

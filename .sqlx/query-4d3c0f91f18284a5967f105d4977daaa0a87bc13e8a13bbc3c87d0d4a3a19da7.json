@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT i.account_login, i.repository_selection\n         FROM installations i\n         JOIN user_installations ui ON ui.installation_id = i.installation_id\n         WHERE ui.user_id = $1\n         ORDER BY i.account_login",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_login",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_selection",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "4d3c0f91f18284a5967f105d4977daaa0a87bc13e8a13bbc3c87d0d4a3a19da7"
+}

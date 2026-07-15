@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users\n                 SET access_token_enc = $1, refresh_token_enc = $2, token_expires_at = $3,\n                     status = CASE WHEN status = 'paused' THEN 'paused' ELSE 'active' END\n                 WHERE user_id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "65ab7bb5486975fe5774c96f98bdda6d76dfef82f183e0cf5b3380babf76e104"
+}

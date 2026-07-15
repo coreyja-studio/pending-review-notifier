@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO users (\n                user_id, github_login, github_user_id, access_token_enc,\n                refresh_token_enc, token_expires_at, email, timezone\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::text, 'UTC'))\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Bytea",
+        "Bytea",
+        "Timestamptz",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2c527c0184dba8a8c217bca7e4771c9246a2386d47f43e3a6f261d5d9e89e620"
+}
