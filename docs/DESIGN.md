@@ -170,6 +170,16 @@ Slack/Discord delivery; closed/merged PRs; team dashboards; other people's pendi
 reviews (impossible); OAuth-App fallback; email body previews; org coverage gaps (cut —
 see spike #2).
 
+## Database (Neon)
+
+Prod DB is **Neon**, not Fly Postgres (Corey's call, 2026-07-15): database
+`pending_review_notifier`, role `prn`, on the coreyja.com project
+(broad-truth-38784432) main branch in the Corey org. **Unpooled** connection string —
+sqlx uses prepared statements and Neon's pgbouncer pooler breaks them. Creds in
+1Password ("Pending Review Notifier Neon DB", Byte vault). Verified sqlx-cli connects
+fine with `sslmode=require&channel_binding=require`. The Fly Postgres cluster
+originally provisioned was destroyed before first deploy.
+
 ## Deferred / assumptions log
 
 - App owned by byte-the-bot pending org transfer (byte lacks org-owner rights).

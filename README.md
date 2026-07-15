@@ -15,4 +15,4 @@ Distributed as a GitHub App: install, connect, done.
   `reviews(states: [PENDING], author: <login>)` — one round trip per 50 PRs
 - Anti-flood rule: a review already stale when first seen is **backlog** (dashboard only,
   never emailed); only reviews we *watch* cross the threshold get email
-- Deployed on Fly.io with Fly Postgres
+- Deployed on Fly.io; database on Neon
