@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/prn_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          # Swatinem/rust-cache below handles caching
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Rustfmt
+        run: cargo fmt --check
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version "^0.8" --no-default-features --features postgres,rustls --locked
+
+      - name: Set up database
+        run: |
+          sqlx database create
+          sqlx migrate run
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Check sqlx offline cache
+        run: cargo sqlx prepare --check -- --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+  deploy:
+    name: Deploy
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency: fly-deploy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      # --ha=false: a second machine would run a duplicate cron worker and
+      # double-enqueue jobs (cja's cron tick is not guarded against races).
+      - run: flyctl deploy --remote-only --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

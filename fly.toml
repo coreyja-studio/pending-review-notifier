@@ -1,0 +1,26 @@
+app = "pending-review-notifier"
+primary_region = "ewr"
+kill_signal = "SIGTERM"
+kill_timeout = "10s"
+
+[env]
+PORT = "8080"
+
+[http_service]
+internal_port = 8080
+force_https = true
+# Background jobs and cron must keep running — never scale to zero.
+auto_stop_machines = "off"
+auto_start_machines = true
+min_machines_running = 1
+
+[[http_service.checks]]
+interval = "15s"
+timeout = "5s"
+grace_period = "10s"
+method = "GET"
+path = "/healthz"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "512mb"

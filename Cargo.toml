@@ -1,0 +1,36 @@
+[package]
+name = "prn"
+version = "0.1.0"
+edition = "2024"
+description = "Pending Review Notifier — nags you about your own forgotten pending GitHub reviews"
+
+[dependencies]
+cja = { git = "https://github.com/coreyja/cja", rev = "d23caa0" }
+
+tokio = { version = "1.21", features = ["full"] }
+axum = "0.8"
+maud = { version = "0.27", features = ["axum"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", default-features = false, features = [
+  "postgres",
+  "runtime-tokio-rustls",
+  "chrono",
+  "migrate",
+  "macros",
+  "uuid",
+  "json",
+] }
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
+chrono-tz = "0.10"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+color-eyre = "0.6"
+tracing = "0.1"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
