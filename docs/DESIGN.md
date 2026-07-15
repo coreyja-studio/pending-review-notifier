@@ -164,6 +164,24 @@ refresh. No key rotation in v1.
 | `POST /disconnect` | Revoke + delete |
 | `GET /healthz` | Liveness (version string) |
 
+## CLI mode (end of stack, before wrap-up)
+
+A standalone `prn-check` CLI for people who don't want to trust the hosted service:
+runs with a classic PAT (`GITHUB_TOKEN` env) on the user's own cron. Spike #1 verified
+a plain PAT sees pending reviews through the same GraphQL query — no GitHub App
+involved.
+
+- Same discovery + staleness/backlog logic as the service. **Architectural rule for
+  the sync PR: the discovery core (query building, response parsing, staleness
+  classification, the backlog rule) must be DB-free** — pure types in/out, no sqlx —
+  so the CLI links it without the web/jobs stack.
+- Local state file (e.g. `~/.local/state/prn/state.json`) plays the role of the
+  `pending_reviews` table: first-seen tracking, the anti-flood backlog rule, and
+  notified-at dedupe all work identically.
+- Output: human text (cron's MAILTO delivers it) and `--format json`; nonzero exit
+  when actionable items exist so people can pipe into their own alerting.
+- Distribution: `cargo install` + prebuilt binaries on GitHub Releases.
+
 ## Non-goals for v1
 
 Slack/Discord delivery; closed/merged PRs; team dashboards; other people's pending
