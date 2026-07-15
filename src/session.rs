@@ -2,7 +2,8 @@
 //!
 //! cja owns the `sessions` table and the `session_id` cookie; we attach the
 //! signed-in user via the `user_sessions` mapping table (one row per
-//! signed-in session; no row means anonymous).
+//! signed-in session; no row means anonymous). The mapping row also carries
+//! the per-session CSRF token and the sign-in timestamp used for expiry.
 
 use axum::{
     extract::FromRequestParts,
@@ -10,15 +11,25 @@ use axum::{
     response::{IntoResponse as _, Redirect, Response},
 };
 use cja::server::session::{AppSession, CJASession, Session};
+use rand::RngCore as _;
 use sqlx::PgPool;
+use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
 
 use crate::state::AppState;
+
+/// Signed-in sessions older than this are rejected and reaped on next use.
+pub const SESSION_MAX_AGE_DAYS: i64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct PrnSession {
     inner: CJASession,
     pub user_id: Option<Uuid>,
+    /// Per-session CSRF token; present iff `user_id` is.
+    pub csrf_token: Option<Vec<u8>>,
+    /// When the user signed in (user_sessions.created_at); present iff
+    /// `user_id` is.
+    pub signed_in_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[async_trait::async_trait]
@@ -26,7 +37,10 @@ impl AppSession for PrnSession {
     async fn from_db(pool: &PgPool, session_id: Uuid) -> cja::Result<Self> {
         let row = sqlx::query!(
             r#"
-            SELECT s.session_id, s.created_at, s.updated_at, us.user_id AS "user_id?"
+            SELECT s.session_id, s.created_at, s.updated_at,
+                   us.user_id AS "user_id?",
+                   us.csrf_token AS "csrf_token?",
+                   us.created_at AS "signed_in_at?"
             FROM sessions s
             LEFT JOIN user_sessions us ON us.session_id = s.session_id
             WHERE s.session_id = $1
@@ -43,6 +57,8 @@ impl AppSession for PrnSession {
                 created_at: row.created_at,
             },
             user_id: row.user_id,
+            csrf_token: row.csrf_token,
+            signed_in_at: row.signed_in_at,
         })
     }
 
@@ -54,16 +70,15 @@ impl AppSession for PrnSession {
         .fetch_one(pool)
         .await?;
 
-        Ok(Self {
-            inner,
-            user_id: None,
-        })
+        Ok(Self::from_inner(inner))
     }
 
     fn from_inner(inner: CJASession) -> Self {
         Self {
             inner,
             user_id: None,
+            csrf_token: None,
+            signed_in_at: None,
         }
     }
 
@@ -73,13 +88,21 @@ impl AppSession for PrnSession {
 }
 
 impl PrnSession {
-    /// Attach a user to this session (sign in).
+    /// Attach a user to this session (sign in), minting a fresh CSRF token.
     pub async fn set_user(&self, pool: &PgPool, user_id: Uuid) -> cja::Result<()> {
+        let mut csrf_token = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut csrf_token);
+
         sqlx::query!(
-            "INSERT INTO user_sessions (session_id, user_id) VALUES ($1, $2)
-             ON CONFLICT (session_id) DO UPDATE SET user_id = EXCLUDED.user_id",
+            "INSERT INTO user_sessions (session_id, user_id, csrf_token)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (session_id) DO UPDATE SET
+                user_id = EXCLUDED.user_id,
+                csrf_token = EXCLUDED.csrf_token,
+                created_at = now()",
             *self.session_id(),
-            user_id
+            user_id,
+            &csrf_token
         )
         .execute(pool)
         .await?;
@@ -109,14 +132,40 @@ impl PrnSession {
     }
 }
 
+/// Constant-time comparison of the stored CSRF token against the hex value
+/// submitted in a form. Length differences short-circuit inside `ct_eq`,
+/// which is fine — the length is not a secret.
+pub fn csrf_matches(expected: &[u8], provided_hex: &str) -> bool {
+    // An empty expected token must never match (defensive: it can't happen
+    // with the NOT NULL column, but empty == empty would be a bypass).
+    if expected.is_empty() {
+        return false;
+    }
+    let expected_hex = hex::encode(expected);
+    expected_hex
+        .as_bytes()
+        .ct_eq(provided_hex.as_bytes())
+        .into()
+}
+
 /// Extractor for routes that require a signed-in user.
 ///
-/// Rejects with a redirect to `/login` when the session has no user (or the
-/// user row has since been deleted).
+/// Rejects with a redirect to `/login` when the session has no user, the
+/// user row has since been deleted, or the sign-in is older than
+/// [`SESSION_MAX_AGE_DAYS`] (in which case the stale mapping is reaped).
 pub struct CurrentUser {
     pub session: PrnSession,
     pub user_id: Uuid,
     pub github_login: String,
+    /// Per-session CSRF token for state-changing forms.
+    pub csrf_token: Vec<u8>,
+}
+
+impl CurrentUser {
+    /// Hex form of the CSRF token, as rendered into hidden form inputs.
+    pub fn csrf_hex(&self) -> String {
+        hex::encode(&self.csrf_token)
+    }
 }
 
 impl FromRequestParts<AppState> for CurrentUser {
@@ -130,9 +179,21 @@ impl FromRequestParts<AppState> for CurrentUser {
             .await
             .map_err(axum::response::IntoResponse::into_response)?;
 
-        let Some(user_id) = session.user_id else {
+        let (Some(user_id), Some(csrf_token), Some(signed_in_at)) = (
+            session.user_id,
+            session.csrf_token.clone(),
+            session.signed_in_at,
+        ) else {
             return Err(Redirect::to("/login").into_response());
         };
+
+        // Expire (and reap) old sign-ins rather than letting them live forever.
+        if signed_in_at < chrono::Utc::now() - chrono::Duration::days(SESSION_MAX_AGE_DAYS) {
+            if let Err(err) = session.clear_user(&state.db).await {
+                tracing::error!(?err, "Failed to reap an expired session mapping");
+            }
+            return Err(Redirect::to("/login").into_response());
+        }
 
         let row = sqlx::query!("SELECT github_login FROM users WHERE user_id = $1", user_id)
             .fetch_optional(&state.db)
@@ -151,6 +212,7 @@ impl FromRequestParts<AppState> for CurrentUser {
             session,
             user_id,
             github_login: row.github_login,
+            csrf_token,
         })
     }
 }

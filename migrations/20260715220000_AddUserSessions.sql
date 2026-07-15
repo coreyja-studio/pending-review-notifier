@@ -4,6 +4,10 @@
 CREATE TABLE user_sessions (
   session_id UUID PRIMARY KEY REFERENCES sessions (session_id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
+  -- Per-session CSRF token (random 32 bytes), rendered into state-changing
+  -- forms and validated (constant-time) on POST.
+  csrf_token BYTEA NOT NULL,
+  -- Sign-in time; sessions older than the max age are rejected and reaped.
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

@@ -1,30 +1,25 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM installations",
+  "query": "SELECT * FROM user_installations",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
         "name": "installation_id",
         "type_info": "Int8"
       },
       {
-        "ordinal": 1,
-        "name": "account_login",
-        "type_info": "Text"
-      },
-      {
         "ordinal": 2,
-        "name": "repository_selection",
-        "type_info": "Text"
-      },
-      {
-        "ordinal": 3,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "last_seen_at",
         "type_info": "Timestamptz"
       }
@@ -36,9 +31,8 @@
       false,
       false,
       false,
-      false,
-      true
+      false
     ]
   },
-  "hash": "c61d0cf6f977fe8138548f8f9a80cccb255559dfc09e74799ba339404c75b693"
+  "hash": "d14b590b9cf3d40844bb84fb0317819268696ce6558276bc8b0c3234dcedff73"
 }

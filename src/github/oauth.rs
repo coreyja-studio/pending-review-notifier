@@ -3,10 +3,13 @@
 //!
 //! Security invariants (see the PR checklist):
 //! - The state cookie is HttpOnly + Secure + SameSite=Lax, Max-Age 600,
-//!   stored in cja's *private* (encrypted) cookie jar, and cleared on use.
-//! - Tokens are never logged and only ever stored encrypted.
-//! - Refresh tokens rotate: the new pair is persisted in a single UPDATE
-//!   *before* the new access token is returned to the caller.
+//!   stored in cja's *private* (encrypted) cookie jar, and cleared on use;
+//!   the state comparison is constant-time.
+//! - Tokens are never logged, only stored encrypted, and each ciphertext is
+//!   AAD-bound to its owning user_id.
+//! - Refresh tokens rotate: refreshes for a user are serialized with a row
+//!   lock, and the new pair is persisted in a single UPDATE *before* the new
+//!   access token is returned to the caller.
 
 use axum::{
     extract::{Query, State},
@@ -21,6 +24,7 @@ use cja::server::{
 use color_eyre::eyre::eyre;
 use rand::RngCore as _;
 use serde::Deserialize;
+use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
 
 use crate::{github, session::PrnSession, state::AppState};
@@ -44,7 +48,7 @@ pub async fn login(
     // 32 hex chars = 128 bits of CSRF entropy.
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let oauth_state = bytes.map(|b| format!("{b:02x}")).concat();
+    let oauth_state = hex::encode(bytes);
 
     // Only carry a tz we can actually parse; anything else is dropped.
     let tz = params
@@ -120,7 +124,11 @@ pub async fn callback(
         None => (stored_value, None),
     };
 
-    if params.state.as_deref() != Some(expected_state) {
+    let state_matches = params
+        .state
+        .as_deref()
+        .is_some_and(|provided| bool::from(provided.as_bytes().ct_eq(expected_state.as_bytes())));
+    if !state_matches {
         return (StatusCode::FORBIDDEN, "OAuth state mismatch").into_response();
     }
 
@@ -151,79 +159,129 @@ async fn signed_in_response(
     let viewer = github::fetch_viewer(state, &tokens.access_token).await?;
     let email = github::fetch_primary_email(state, &tokens.access_token).await?;
 
-    let access_token_enc = state.crypto.encrypt(&tokens.access_token)?;
-    let refresh_token_enc = state.crypto.encrypt(&tokens.refresh_token)?;
     let token_expires_at = Utc::now() + chrono::Duration::seconds(tokens.expires_in);
 
-    // Upsert by the rename-stable github_user_id. The timezone is only taken
-    // from the login flow while the column still holds the default 'UTC' — a
-    // user-chosen timezone is never clobbered by a re-login. A re-login also
-    // clears needs_reauth (the user just proved they can auth), but leaves a
-    // deliberate 'paused' alone.
-    let user_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO users (
-            github_login, github_user_id, access_token_enc, refresh_token_enc,
-            token_expires_at, email, timezone
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::text, 'UTC'))
-        ON CONFLICT (github_user_id) DO UPDATE SET
-            github_login = EXCLUDED.github_login,
-            email = EXCLUDED.email,
-            access_token_enc = EXCLUDED.access_token_enc,
-            refresh_token_enc = EXCLUDED.refresh_token_enc,
-            token_expires_at = EXCLUDED.token_expires_at,
-            timezone = CASE
-                WHEN users.timezone = 'UTC' THEN COALESCE($7::text, users.timezone)
-                ELSE users.timezone
-            END,
-            status = CASE
-                WHEN users.status = 'needs_reauth' THEN 'active'
-                ELSE users.status
-            END
-        RETURNING user_id
-        "#,
-        viewer.login,
-        viewer.database_id,
-        access_token_enc,
-        refresh_token_enc,
-        token_expires_at,
-        email,
-        tz.as_deref(),
+    // Upsert by the rename-stable github_user_id. Token ciphertexts are
+    // AAD-bound to the user_id, which for an existing user must be the row's
+    // id — so lock the row first, then encrypt under the definitive id.
+    // (Two truly concurrent FIRST sign-ins of the same account can race to a
+    // unique violation; that 500 is a retry-once curiosity, not a lockout.)
+    //
+    // The timezone is only taken from the login flow while the column still
+    // holds the default 'UTC' — a user-chosen timezone is never clobbered by
+    // a re-login. A re-login also clears needs_reauth (the user just proved
+    // they can auth), but leaves a deliberate 'paused' alone.
+    let mut tx = state.db.begin().await?;
+    let existing_user_id = sqlx::query_scalar!(
+        "SELECT user_id FROM users WHERE github_user_id = $1 FOR UPDATE",
+        viewer.database_id
     )
-    .fetch_one(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
 
+    let user_id = existing_user_id.unwrap_or_else(Uuid::new_v4);
+    let access_token_enc = state
+        .crypto
+        .encrypt(&tokens.access_token, user_id.as_bytes())?;
+    let refresh_token_enc = state
+        .crypto
+        .encrypt(&tokens.refresh_token, user_id.as_bytes())?;
+
+    if existing_user_id.is_some() {
+        sqlx::query!(
+            r#"
+            UPDATE users SET
+                github_login = $1,
+                email = $2,
+                access_token_enc = $3,
+                refresh_token_enc = $4,
+                token_expires_at = $5,
+                timezone = CASE
+                    WHEN timezone = 'UTC' THEN COALESCE($6::text, timezone)
+                    ELSE timezone
+                END,
+                status = CASE
+                    WHEN status = 'needs_reauth' THEN 'active'
+                    ELSE status
+                END
+            WHERE user_id = $7
+            "#,
+            viewer.login,
+            email,
+            access_token_enc,
+            refresh_token_enc,
+            token_expires_at,
+            tz.as_deref(),
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query!(
+            r#"
+            INSERT INTO users (
+                user_id, github_login, github_user_id, access_token_enc,
+                refresh_token_enc, token_expires_at, email, timezone
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::text, 'UTC'))
+            "#,
+            user_id,
+            viewer.login,
+            viewer.database_id,
+            access_token_enc,
+            refresh_token_enc,
+            token_expires_at,
+            email,
+            tz.as_deref(),
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    // Installations are shared entities (org mates see the same ones), so
+    // the row itself is upserted separately from this user's link to it.
     let installations = github::fetch_user_installations(state, &tokens.access_token).await?;
     for installation in &installations {
         sqlx::query!(
             r#"
             INSERT INTO installations (
-                installation_id, account_login, user_id, repository_selection, last_seen_at
+                installation_id, account_login, repository_selection, last_seen_at
             )
-            VALUES ($1, $2, $3, $4, now())
+            VALUES ($1, $2, $3, now())
             ON CONFLICT (installation_id) DO UPDATE SET
                 account_login = EXCLUDED.account_login,
-                user_id = EXCLUDED.user_id,
                 repository_selection = EXCLUDED.repository_selection,
                 last_seen_at = now()
             "#,
             installation.id,
             installation.account_login,
-            user_id,
             installation.repository_selection,
+        )
+        .execute(&state.db)
+        .await?;
+
+        sqlx::query!(
+            "INSERT INTO user_installations (user_id, installation_id, last_seen_at)
+             VALUES ($1, $2, now())
+             ON CONFLICT (user_id, installation_id) DO UPDATE SET last_seen_at = now()",
+            user_id,
+            installation.id,
         )
         .execute(&state.db)
         .await?;
     }
 
-    // Fresh session per sign-in; save the cookie the same way cja does.
+    // Fresh session per sign-in. cja's extractor would save this cookie
+    // without SameSite, so we set it ourselves (Lax) — the extractor only
+    // ever writes cookies for the anonymous sessions it auto-creates.
     let session = PrnSession::create(&state.db).await?;
     session.set_user(&state.db, user_id).await?;
     let session_cookie = Cookie::build(("session_id", session.session_id().to_string()))
         .path("/")
         .http_only(true)
         .secure(true)
+        .same_site(SameSite::Lax)
         .build();
     jar.add(session_cookie);
 
@@ -245,9 +303,11 @@ struct TokenPair {
 }
 
 enum TokenRequestError {
-    /// GitHub answered and said no (OAuth error payload or non-2xx status).
+    /// GitHub definitively said no: an OAuth error payload (HTTP 200 +
+    /// `error` field) or a 4xx status. Safe to treat as "this grant is dead".
     Rejected(color_eyre::Report),
-    /// We never got a usable answer (network, deserialization, ...).
+    /// No usable answer: network failure, deserialization failure, or a 5xx
+    /// (GitHub being down must never mark users needs_reauth).
     Transport(color_eyre::Report),
 }
 
@@ -281,6 +341,11 @@ async fn token_request(
         .map_err(|err| TokenRequestError::Transport(err.into()))?;
 
     let status = response.status();
+    if status.is_server_error() {
+        return Err(TokenRequestError::Transport(eyre!(
+            "token endpoint returned HTTP {status}"
+        )));
+    }
     if !status.is_success() {
         return Err(TokenRequestError::Rejected(eyre!(
             "token endpoint returned HTTP {status}"
@@ -329,27 +394,41 @@ async fn exchange_code(state: &AppState, code: &str) -> cja::Result<TokenPair> {
 /// Return a valid access token for the user, refreshing (and rotating the
 /// stored pair) if it expires within 5 minutes.
 ///
-/// On a definitive refresh rejection (e.g. `bad_refresh_token`) the user is
-/// marked `needs_reauth` and an error is returned. Transient transport
-/// failures return an error without changing the user's status, so a GitHub
-/// blip doesn't force everyone back through OAuth.
+/// Concurrency: the user row is locked (`FOR UPDATE`) for the duration, so
+/// two concurrent callers can't both spend the single-use refresh token —
+/// the second blocks, then sees the already-rotated fresh pair and returns
+/// it without another HTTP call.
 ///
-/// Public API for the sync jobs landing in the next PR.
-#[allow(dead_code)] // Exercised by tests today; sync jobs are the real caller.
+/// On a definitive refresh rejection (e.g. `bad_refresh_token`, 4xx) the
+/// user is marked `needs_reauth` and an error is returned. Transport
+/// failures and 5xx return an error without changing the user's status, so
+/// a GitHub blip doesn't force everyone back through OAuth.
+///
+/// Used by /disconnect today; the sync jobs in the next PR are the main caller.
 pub async fn ensure_fresh_token(state: &AppState, user_id: Uuid) -> cja::Result<String> {
+    let mut tx = state.db.begin().await?;
+
     let row = sqlx::query!(
         "SELECT access_token_enc, refresh_token_enc, token_expires_at
-         FROM users WHERE user_id = $1",
+         FROM users WHERE user_id = $1
+         FOR UPDATE",
         user_id
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
 
+    // This read happened under the lock: if a concurrent caller refreshed
+    // while we waited for it, the expiry is already fresh and we're done.
     if row.token_expires_at > Utc::now() + chrono::Duration::minutes(5) {
-        return state.crypto.decrypt(&row.access_token_enc);
+        tx.commit().await?;
+        return state
+            .crypto
+            .decrypt(&row.access_token_enc, user_id.as_bytes());
     }
 
-    let refresh_token = state.crypto.decrypt(&row.refresh_token_enc)?;
+    let refresh_token = state
+        .crypto
+        .decrypt(&row.refresh_token_enc, user_id.as_bytes())?;
     let form = [
         ("client_id", state.config.github_client_id.as_str()),
         ("client_secret", state.config.github_client_secret.as_str()),
@@ -357,28 +436,38 @@ pub async fn ensure_fresh_token(state: &AppState, user_id: Uuid) -> cja::Result<
         ("refresh_token", refresh_token.as_str()),
     ];
 
+    // The HTTP call deliberately happens while holding the row lock — that
+    // is what serializes concurrent refreshes (GitHub consumes the refresh
+    // token on first use).
     match token_request(state, &form).await {
         Ok(pair) => {
-            let access_token_enc = state.crypto.encrypt(&pair.access_token)?;
-            let refresh_token_enc = state.crypto.encrypt(&pair.refresh_token)?;
+            let access_token_enc = state
+                .crypto
+                .encrypt(&pair.access_token, user_id.as_bytes())?;
+            let refresh_token_enc = state
+                .crypto
+                .encrypt(&pair.refresh_token, user_id.as_bytes())?;
             let token_expires_at = Utc::now() + chrono::Duration::seconds(pair.expires_in);
 
-            // Refresh tokens rotate: persist BOTH new tokens atomically, and
-            // do it before handing the new access token to the caller — if we
-            // die after this statement nothing is lost, whereas using the
-            // token first and persisting later could strand the new refresh
-            // token and lock the user out.
+            // Refresh tokens rotate: persist BOTH new tokens in one UPDATE,
+            // and do it before handing the new access token to the caller —
+            // if we die after this statement nothing is lost, whereas using
+            // the token first and persisting later could strand the new
+            // refresh token and lock the user out. A successful refresh also
+            // self-heals a false needs_reauth (paused stays paused).
             sqlx::query!(
                 "UPDATE users
-                 SET access_token_enc = $1, refresh_token_enc = $2, token_expires_at = $3
+                 SET access_token_enc = $1, refresh_token_enc = $2, token_expires_at = $3,
+                     status = CASE WHEN status = 'paused' THEN 'paused' ELSE 'active' END
                  WHERE user_id = $4",
                 access_token_enc,
                 refresh_token_enc,
                 token_expires_at,
                 user_id
             )
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
 
             Ok(pair.access_token)
         }
@@ -387,12 +476,14 @@ pub async fn ensure_fresh_token(state: &AppState, user_id: Uuid) -> cja::Result<
                 "UPDATE users SET status = 'needs_reauth' WHERE user_id = $1",
                 user_id
             )
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             Err(report.wrap_err("GitHub rejected the refresh token; user marked needs_reauth"))
         }
         Err(TokenRequestError::Transport(report)) => {
-            Err(report.wrap_err("token refresh request failed"))
+            // Dropping the transaction rolls it back; status is untouched.
+            Err(report.wrap_err("token refresh request failed (transient; status unchanged)"))
         }
     }
 }
@@ -433,13 +524,18 @@ mod tests {
         (test_state(db, config), mock)
     }
 
-    /// Collapse a response's Set-Cookie headers into a Cookie request header.
+    /// Collapse a response's Set-Cookie headers into a Cookie request header,
+    /// honouring removals (empty values) the way a browser would.
     fn cookie_header(response: &axum::response::Response) -> String {
         response
             .headers()
             .get_all(header::SET_COOKIE)
             .iter()
-            .map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string())
+            .map(|v| v.to_str().unwrap().split(';').next().unwrap())
+            .filter(|pair| {
+                pair.split_once('=')
+                    .is_some_and(|(_, value)| !value.is_empty())
+            })
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -487,6 +583,40 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// Sign in through the full login+callback flow; returns the session
+    /// cookie header for subsequent requests.
+    async fn sign_in(app: &Router) -> String {
+        let (oauth_state, cookies) = do_login(app, "/login").await;
+        let response = do_callback(app, &oauth_state, &cookies).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        cookie_header(&response)
+    }
+
+    fn post_form(uri: &str, cookies: &str, body: String) -> Request<Body> {
+        Request::post(uri)
+            .header(header::COOKIE, cookies)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// The one signed-in session's CSRF token, as the forms would render it.
+    async fn csrf_hex(db: &PgPool) -> String {
+        let token = sqlx::query_scalar!("SELECT csrf_token FROM user_sessions")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        hex::encode(token)
+    }
+
+    /// Pull the CSRF hidden-input value out of rendered dashboard HTML.
+    fn extract_csrf(body: &str) -> String {
+        let marker = "name=\"csrf\" value=\"";
+        let start = body.find(marker).expect("a csrf hidden input") + marker.len();
+        let end = start + body[start..].find('"').unwrap();
+        body[start..end].to_string()
     }
 
     fn mount_token_exchange(mock: &MockServer) -> impl std::future::Future<Output = ()> + '_ {
@@ -543,20 +673,24 @@ mod tests {
         refresh: &str,
         expires_at: DateTime<Utc>,
     ) -> Uuid {
-        sqlx::query_scalar!(
+        // user_id is generated app-side so the token ciphertexts can be
+        // AAD-bound to it, same as the real callback path.
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
             "INSERT INTO users (
-                github_login, github_user_id, access_token_enc, refresh_token_enc,
-                token_expires_at, email
+                user_id, github_login, github_user_id, access_token_enc,
+                refresh_token_enc, token_expires_at, email
             )
-            VALUES ('coreyja', 12345, $1, $2, $3, 'corey@example.com')
-            RETURNING user_id",
-            state.crypto.encrypt(access).unwrap(),
-            state.crypto.encrypt(refresh).unwrap(),
+            VALUES ($1, 'coreyja', 12345, $2, $3, $4, 'corey@example.com')",
+            user_id,
+            state.crypto.encrypt(access, user_id.as_bytes()).unwrap(),
+            state.crypto.encrypt(refresh, user_id.as_bytes()).unwrap(),
             expires_at
         )
-        .fetch_one(&state.db)
+        .execute(&state.db)
         .await
-        .unwrap()
+        .unwrap();
+        user_id
     }
 
     #[tokio::test]
@@ -668,6 +802,26 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn callback_state_cannot_be_replayed_after_success(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let (oauth_state, cookies) = do_login(&app, "/login").await;
+        let success = do_callback(&app, &oauth_state, &cookies).await;
+        assert_eq!(success.status(), StatusCode::SEE_OTHER);
+
+        // A browser now holds the session cookie and honoured the state
+        // cookie's removal; replaying the same callback URL is refused.
+        let post_success_cookies = cookie_header(&success);
+        assert!(!post_success_cookies.contains("oauth_state"));
+        let replay = do_callback(&app, &oauth_state, &post_success_cookies).await;
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
     async fn callback_signs_up_user_and_reaches_dashboard(db: PgPool) {
         let (state, mock) = mock_backed_state(db.clone()).await;
         mount_token_exchange(&mock).await;
@@ -698,19 +852,20 @@ mod tests {
         assert_eq!(user.email, "corey@example.com");
         assert_eq!(user.timezone, "America/New_York");
         assert_eq!(user.status, "active");
+        let aad = user.user_id.as_bytes();
         assert_eq!(
-            state.crypto.decrypt(&user.access_token_enc).unwrap(),
+            state.crypto.decrypt(&user.access_token_enc, aad).unwrap(),
             "gho_test_access"
         );
         assert_eq!(
-            state.crypto.decrypt(&user.refresh_token_enc).unwrap(),
+            state.crypto.decrypt(&user.refresh_token_enc, aad).unwrap(),
             "ghr_test_refresh"
         );
         assert!(user.token_expires_at > Utc::now() + chrono::Duration::hours(7));
         // Nothing token-shaped may be stored in the clear.
         assert_ne!(user.access_token_enc, b"gho_test_access");
 
-        // The installation got upserted.
+        // The installation row and this user's link to it got upserted.
         let installation = sqlx::query!("SELECT * FROM installations")
             .fetch_one(&db)
             .await
@@ -718,10 +873,27 @@ mod tests {
         assert_eq!(installation.installation_id, 987);
         assert_eq!(installation.account_login, "coreyja-studio");
         assert_eq!(installation.repository_selection, "selected");
-        assert_eq!(installation.user_id, Some(user.user_id));
         assert!(installation.last_seen_at.is_some());
+        let link = sqlx::query!("SELECT * FROM user_installations")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(link.user_id, user.user_id);
+        assert_eq!(link.installation_id, 987);
 
-        // The session cookie signs us into the dashboard.
+        // The session cookie carries SameSite=Lax and signs us into the
+        // dashboard.
+        let session_set_cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .find(|c| c.starts_with("session_id="))
+            .expect("callback must set the session cookie");
+        assert!(session_set_cookie.contains("SameSite=Lax"));
+        assert!(session_set_cookie.contains("HttpOnly"));
+        assert!(session_set_cookie.contains("Secure"));
+
         let session_cookies = cookie_header(&response);
         let dashboard = app
             .clone()
@@ -741,15 +913,17 @@ mod tests {
         assert!(body.contains("coreyja"));
         assert!(body.contains("coreyja-studio"));
 
-        // Logout detaches the user; the dashboard bounces to /login again.
+        // Logout (with the CSRF token rendered into the form) detaches the
+        // user; the dashboard bounces to /login again.
+        let csrf = extract_csrf(&body);
+        assert_eq!(csrf, csrf_hex(&db).await);
         let logout = app
             .clone()
-            .oneshot(
-                Request::post("/logout")
-                    .header(header::COOKIE, &session_cookies)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(post_form(
+                "/logout",
+                &session_cookies,
+                format!("csrf={csrf}"),
+            ))
             .await
             .unwrap();
         assert_eq!(logout.status(), StatusCode::SEE_OTHER);
@@ -822,7 +996,10 @@ mod tests {
         assert_eq!(user.timezone, "Europe/Berlin");
         assert_eq!(user.status, "active");
         assert_eq!(
-            state.crypto.decrypt(&user.access_token_enc).unwrap(),
+            state
+                .crypto
+                .decrypt(&user.access_token_enc, user_id.as_bytes())
+                .unwrap(),
             "gho_test_access"
         );
     }
@@ -880,14 +1057,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            state.crypto.decrypt(&user.access_token_enc).unwrap(),
+            state
+                .crypto
+                .decrypt(&user.access_token_enc, user_id.as_bytes())
+                .unwrap(),
             "gho_new"
         );
         assert_eq!(
-            state.crypto.decrypt(&user.refresh_token_enc).unwrap(),
+            state
+                .crypto
+                .decrypt(&user.refresh_token_enc, user_id.as_bytes())
+                .unwrap(),
             "ghr_new"
         );
         assert!(user.token_expires_at > Utc::now() + chrono::Duration::hours(7));
+        assert_eq!(user.status, "active");
+    }
+
+    #[sqlx::test]
+    async fn concurrent_refreshes_hit_github_once(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        // expect(1): the refresh token is single-use at GitHub, so a second
+        // POST here would be the concurrency bug this test guards against.
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gho_new",
+                "refresh_token": "ghr_new",
+                "expires_in": 28800,
+                "refresh_token_expires_in": 15_897_600,
+                "token_type": "bearer",
+                "scope": ""
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let user_id = insert_user(
+            &state,
+            "gho_old",
+            "ghr_old",
+            Utc::now() - chrono::Duration::hours(1),
+        )
+        .await;
+
+        let (a, b) = tokio::join!(
+            ensure_fresh_token(&state, user_id),
+            ensure_fresh_token(&state, user_id)
+        );
+        // Both callers succeed: one refreshed, the other waited on the row
+        // lock and returned the freshly-stored token.
+        assert_eq!(a.unwrap(), "gho_new");
+        assert_eq!(b.unwrap(), "gho_new");
+
+        let user = sqlx::query!("SELECT status FROM users WHERE user_id = $1", user_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
         assert_eq!(user.status, "active");
     }
 
@@ -922,13 +1149,148 @@ mod tests {
         assert_eq!(user.status, "needs_reauth");
         // The old pair is left in place (not clobbered with garbage).
         assert_eq!(
-            state.crypto.decrypt(&user.access_token_enc).unwrap(),
+            state
+                .crypto
+                .decrypt(&user.access_token_enc, user_id.as_bytes())
+                .unwrap(),
             "gho_old"
         );
         assert_eq!(
-            state.crypto.decrypt(&user.refresh_token_enc).unwrap(),
+            state
+                .crypto
+                .decrypt(&user.refresh_token_enc, user_id.as_bytes())
+                .unwrap(),
             "ghr_old"
         );
+    }
+
+    #[sqlx::test]
+    async fn refresh_5xx_is_transient_and_does_not_mark_needs_reauth(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        // GitHub being down is not the user's fault: no needs_reauth.
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock)
+            .await;
+
+        let user_id = insert_user(
+            &state,
+            "gho_old",
+            "ghr_old",
+            Utc::now() - chrono::Duration::hours(1),
+        )
+        .await;
+
+        let result = ensure_fresh_token(&state, user_id).await;
+        assert!(result.is_err());
+
+        let user = sqlx::query!("SELECT * FROM users WHERE user_id = $1", user_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(user.status, "active");
+        assert_eq!(
+            state
+                .crypto
+                .decrypt(&user.refresh_token_enc, user_id.as_bytes())
+                .unwrap(),
+            "ghr_old"
+        );
+    }
+
+    #[sqlx::test]
+    async fn expired_session_redirects_to_login_and_is_reaped(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = sign_in(&app).await;
+
+        sqlx::query!("UPDATE user_sessions SET created_at = now() - interval '31 days'")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/dashboard")
+                    .header(header::COOKIE, &session_cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&response), "/login");
+
+        // The expired mapping was reaped, not left to linger.
+        let mappings = sqlx::query_scalar!("SELECT count(*) FROM user_sessions")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(mappings, Some(0));
+    }
+
+    #[sqlx::test]
+    async fn disconnect_and_logout_require_a_valid_csrf_token(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = sign_in(&app).await;
+        let good_csrf = csrf_hex(&db).await;
+
+        // A cross-site form post rides the session cookie but cannot know
+        // the per-session CSRF token.
+        for body in [
+            String::new(),
+            format!("csrf={}", "0".repeat(64)),
+            "csrf=".to_string(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post_form("/disconnect", &session_cookies, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "body: {body:?}");
+
+            let response = app
+                .clone()
+                .oneshot(post_form("/logout", &session_cookies, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "body: {body:?}");
+        }
+
+        // The account survived all of it, still signed in.
+        let users = sqlx::query_scalar!("SELECT count(*) FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(users, Some(1));
+        let mappings = sqlx::query_scalar!("SELECT count(*) FROM user_sessions")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(mappings, Some(1));
+
+        // With the real token, logout works.
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/logout",
+                &session_cookies,
+                format!("csrf={good_csrf}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
     }
 
     #[sqlx::test]
@@ -954,35 +1316,34 @@ mod tests {
             .await;
         let app = test_app(&state);
 
-        let (oauth_state, cookies) = do_login(&app, "/login").await;
-        let signed_in = do_callback(&app, &oauth_state, &cookies).await;
-        let session_cookies = cookie_header(&signed_in);
+        let session_cookies = sign_in(&app).await;
+        let csrf = csrf_hex(&db).await;
 
         let response = app
             .clone()
-            .oneshot(
-                Request::post("/disconnect")
-                    .header(header::COOKIE, &session_cookies)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(post_form(
+                "/disconnect",
+                &session_cookies,
+                format!("csrf={csrf}"),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(location(&response), "/");
 
-        // Everything is gone: user, installations (CASCADE), session mapping,
-        // and the session row itself.
+        // The user and everything hanging off them is gone. The shared
+        // installation row survives (it isn't this user's property), but the
+        // link to it is gone.
         let users = sqlx::query_scalar!("SELECT count(*) FROM users")
             .fetch_one(&db)
             .await
             .unwrap();
         assert_eq!(users, Some(0));
-        let installations = sqlx::query_scalar!("SELECT count(*) FROM installations")
+        let links = sqlx::query_scalar!("SELECT count(*) FROM user_installations")
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(installations, Some(0));
+        assert_eq!(links, Some(0));
         let mappings = sqlx::query_scalar!("SELECT count(*) FROM user_sessions")
             .fetch_one(&db)
             .await
@@ -993,6 +1354,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions, Some(0));
+    }
+
+    #[sqlx::test]
+    async fn disconnect_refreshes_an_expired_token_before_revoking(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gho_refreshed",
+                "refresh_token": "ghr_refreshed",
+                "expires_in": 28800,
+                "refresh_token_expires_in": 15_897_600,
+                "token_type": "bearer",
+                "scope": ""
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        // Revocation must use the *fresh* token, not the expired one.
+        Mock::given(method("DELETE"))
+            .and(path("/applications/test-client-id/grant"))
+            .and(body_string_contains("gho_refreshed"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let app = test_app(&state);
+
+        let session_cookies = sign_in(&app).await;
+        let csrf = csrf_hex(&db).await;
+        sqlx::query!("UPDATE users SET token_expires_at = now() - interval '1 hour'")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/disconnect",
+                &session_cookies,
+                format!("csrf={csrf}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let users = sqlx::query_scalar!("SELECT count(*) FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(users, Some(0));
     }
 
     #[sqlx::test]
@@ -1008,18 +1424,16 @@ mod tests {
             .await;
         let app = test_app(&state);
 
-        let (oauth_state, cookies) = do_login(&app, "/login").await;
-        let signed_in = do_callback(&app, &oauth_state, &cookies).await;
-        let session_cookies = cookie_header(&signed_in);
+        let session_cookies = sign_in(&app).await;
+        let csrf = csrf_hex(&db).await;
 
         let response = app
             .clone()
-            .oneshot(
-                Request::post("/disconnect")
-                    .header(header::COOKIE, &session_cookies)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(post_form(
+                "/disconnect",
+                &session_cookies,
+                format!("csrf={csrf}"),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT count(*) FROM installations",
+  "query": "SELECT count(*) FROM user_installations",
   "describe": {
     "columns": [
       {
@@ -16,5 +16,5 @@
       null
     ]
   },
-  "hash": "ec1bb01129a07554a90b770cc6db966a48a104d847f483358fbf51a509d3d9ad"
+  "hash": "4fb7ba847ad96c25b616e415133264dcacbf6c71c89f12fb2cc36a5f18f58c2c"
 }

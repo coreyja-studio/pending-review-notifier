@@ -70,7 +70,10 @@ impl AppState {
             .await
             .wrap_err("Failed to run migrations")?;
 
-        let cookie_key = CookieKey::from_env_or_generate()?;
+        // COOKIE_KEY is required (no generate-on-boot fallback): a fresh key
+        // per boot would invalidate every session and break any OAuth login
+        // that is mid-flight (encrypted state cookie) across a deploy.
+        let cookie_key = cookie_key_from_env()?;
 
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
@@ -85,6 +88,27 @@ impl AppState {
             http,
         })
     }
+}
+
+/// Same derivation as cja's `CookieKey::from_env_or_generate`, minus the
+/// generate fallback: missing/invalid COOKIE_KEY is a startup error.
+fn cookie_key_from_env() -> cja::Result<CookieKey> {
+    use base64::Engine as _;
+
+    let key_b64 = std::env::var("COOKIE_KEY").wrap_err(
+        "Missing COOKIE_KEY (base64, >= 32 bytes decoded) — sessions and in-flight \
+         OAuth logins must survive restarts, so a per-boot key is not acceptable",
+    )?;
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(key_b64.trim())
+        .wrap_err("COOKIE_KEY is not valid base64")?;
+    if key_bytes.len() < 32 {
+        return Err(color_eyre::eyre::eyre!(
+            "COOKIE_KEY must decode to at least 32 bytes, got {}",
+            key_bytes.len()
+        ));
+    }
+    Ok(CookieKey(tower_cookies::Key::derive_from(&key_bytes)))
 }
 
 impl cja::app_state::AppState for AppState {

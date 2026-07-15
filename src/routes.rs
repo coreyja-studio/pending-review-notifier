@@ -1,5 +1,5 @@
 use axum::{
-    Router,
+    Form, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse as _, Redirect, Response},
@@ -13,12 +13,23 @@ use cja::{
     },
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
+use serde::Deserialize;
 
 use crate::{
     github,
-    session::{CurrentUser, PrnSession},
+    session::{CurrentUser, PrnSession, csrf_matches},
     state::AppState,
 };
+
+/// Hidden-input payload carried by every state-changing form.
+#[derive(Deserialize)]
+struct CsrfForm {
+    csrf: Option<String>,
+}
+
+fn csrf_rejection() -> Response {
+    (StatusCode::FORBIDDEN, "CSRF token mismatch").into_response()
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -87,9 +98,11 @@ async fn landing() -> Markup {
 
 async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, Response> {
     let installations = sqlx::query!(
-        "SELECT account_login, repository_selection
-         FROM installations WHERE user_id = $1
-         ORDER BY account_login",
+        "SELECT i.account_login, i.repository_selection
+         FROM installations i
+         JOIN user_installations ui ON ui.installation_id = i.installation_id
+         WHERE ui.user_id = $1
+         ORDER BY i.account_login",
         user.user_id
     )
     .fetch_all(&state.db)
@@ -124,10 +137,12 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
                 p { a href=(github::INSTALL_URL) { "Add more repos" } }
 
                 form method="post" action="/logout" {
+                    input type="hidden" name="csrf" value=(user.csrf_hex());
                     button type="submit" { "Log out" }
                 }
                 form method="post" action="/disconnect"
                     onsubmit="return confirm('Disconnect from GitHub and delete all your data? This cannot be undone.')" {
+                    input type="hidden" name="csrf" value=(user.csrf_hex());
                     button type="submit" { "Disconnect" }
                 }
             }
@@ -136,46 +151,79 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
 }
 
 /// `POST /logout` — detach the user from the session (the anonymous session
-/// and its cookie live on).
+/// and its cookie live on). CSRF-guarded when a user is attached.
 async fn logout(
     State(state): State<AppState>,
     Session(session): Session<PrnSession>,
+    Form(form): Form<CsrfForm>,
 ) -> Result<Redirect, Response> {
-    session
-        .clear_user(&state.db)
-        .await
-        .map_err(internal_error)?;
+    if session.user_id.is_some() {
+        let expected = session.csrf_token.as_deref().unwrap_or_default();
+        if !csrf_matches(expected, form.csrf.as_deref().unwrap_or_default()) {
+            return Err(csrf_rejection());
+        }
+        session
+            .clear_user(&state.db)
+            .await
+            .map_err(internal_error)?;
+    }
     Ok(Redirect::to("/"))
 }
 
 /// `POST /disconnect` — revoke the grant at GitHub, delete the user (cascades
-/// installations, pending reviews, and session mappings), destroy the session.
+/// pending reviews, installation links, and session mappings), destroy the
+/// session. CSRF-guarded.
 async fn disconnect(
     State(state): State<AppState>,
     user: CurrentUser,
     jar: CookieJar<AppState>,
+    Form(form): Form<CsrfForm>,
 ) -> Result<Redirect, Response> {
-    let row = sqlx::query!(
-        "SELECT access_token_enc FROM users WHERE user_id = $1",
-        user.user_id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(internal_error)?;
+    if !csrf_matches(&user.csrf_token, form.csrf.as_deref().unwrap_or_default()) {
+        return Err(csrf_rejection());
+    }
 
-    // Best-effort revocation: local deletion must not be blockable by GitHub
-    // flakiness. 404/422 already count as success inside revoke_grant.
-    match state.crypto.decrypt(&row.access_token_enc) {
-        Ok(access_token) => {
+    // Revoke with a *fresh* access token where possible — GitHub may not
+    // accept an expired one, and a dangling grant keeps the ~6-month refresh
+    // token alive on their side. If the refresh fails, still try with the
+    // stored token. Either way, revocation is best-effort: local deletion
+    // must never be blockable by GitHub flakiness (404/422 already count as
+    // success inside revoke_grant).
+    let access_token = match github::oauth::ensure_fresh_token(&state, user.user_id).await {
+        Ok(token) => Some(token),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "Refresh before revocation failed; falling back to the stored token"
+            );
+            let row = sqlx::query!(
+                "SELECT access_token_enc FROM users WHERE user_id = $1",
+                user.user_id
+            )
+            .fetch_one(&state.db)
+            .await
+            .map_err(internal_error)?;
+            match state
+                .crypto
+                .decrypt(&row.access_token_enc, user.user_id.as_bytes())
+            {
+                Ok(token) => Some(token),
+                Err(err) => {
+                    tracing::error!(?err, "Could not decrypt the stored token for revocation");
+                    None
+                }
+            }
+        }
+    };
+
+    match access_token {
+        Some(access_token) => {
             if let Err(err) = github::revoke_grant(&state, &access_token).await {
                 tracing::error!(?err, "Grant revocation failed; deleting local data anyway");
             }
         }
-        Err(err) => {
-            tracing::error!(
-                ?err,
-                "Could not decrypt access token for revocation; deleting local data anyway"
-            );
+        None => {
+            tracing::error!("No usable access token for revocation; deleting local data anyway");
         }
     }
 
