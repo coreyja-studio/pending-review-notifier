@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT is_backlog FROM pending_reviews WHERE review_id = 'R1'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "is_backlog",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "79acfec8ea63d7af4a4322f9f3e4de5fecc2523a89f198b17624f69c58764fb3"
+}

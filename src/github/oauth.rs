@@ -17,6 +17,7 @@ use axum::{
     response::{IntoResponse as _, Redirect, Response},
 };
 use chrono::Utc;
+use cja::jobs::Job as _;
 use cja::server::{
     cookies::{Cookie, CookieJar, SameSite},
     session::AppSession as _,
@@ -284,6 +285,16 @@ async fn signed_in_response(
         .same_site(SameSite::Lax)
         .build();
     jar.add(session_cookie);
+
+    // Kick off an initial pending-review sync so the dashboard has data on the
+    // user's first visit. Best-effort: a queue hiccup must not fail the login —
+    // the SyncSweep cron will pick the user up within 30 min regardless.
+    if let Err(error) = (crate::jobs::SyncUser { user_id })
+        .enqueue(state.clone(), "signup".to_string(), None)
+        .await
+    {
+        tracing::error!(?error, %user_id, "failed to enqueue initial SyncUser on signup");
+    }
 
     let destination = if installations.is_empty() {
         github::INSTALL_URL

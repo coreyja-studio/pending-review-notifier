@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pending_reviews WHERE user_id = $1 AND last_seen_at < $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "86350dd9c427a68852881030c42b92463294838804a31de540568b10a1b5a0ec"
+}

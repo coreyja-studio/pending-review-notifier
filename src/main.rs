@@ -9,6 +9,7 @@ use tokio::task::JoinError;
 
 mod cron;
 mod crypto;
+mod discovery;
 mod github;
 mod jobs;
 mod routes;
