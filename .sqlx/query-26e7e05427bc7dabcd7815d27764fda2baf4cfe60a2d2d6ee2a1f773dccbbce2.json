@@ -67,6 +67,11 @@
         "ordinal": 12,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "last_digest_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -85,7 +90,8 @@
       false,
       false,
       true,
-      false
+      false,
+      true
     ]
   },
   "hash": "26e7e05427bc7dabcd7815d27764fda2baf4cfe60a2d2d6ee2a1f773dccbbce2"

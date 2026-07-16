@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, pr_title, repo_name_with_owner, pr_url, comment_count, last_comment_at, is_backlog\n         FROM pending_reviews\n         WHERE user_id = $1 AND dismissed_at IS NULL\n         ORDER BY last_comment_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "pr_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "repo_name_with_owner",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "pr_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "comment_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_comment_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "is_backlog",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "00f8b8d81c7df45999c080e50956101516ca9716d79ab6140d8d4570df1e7114"
+}

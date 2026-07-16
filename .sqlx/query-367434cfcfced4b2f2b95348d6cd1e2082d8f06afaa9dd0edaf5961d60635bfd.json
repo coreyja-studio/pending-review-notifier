@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO users (\n                user_id, github_login, github_user_id, access_token_enc,\n                refresh_token_enc, token_expires_at, email\n            )\n            VALUES ($1, 'other', 99999, $2, $3, $4, 'other@example.com')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Bytea",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "367434cfcfced4b2f2b95348d6cd1e2082d8f06afaa9dd0edaf5961d60635bfd"
+}

@@ -10,6 +10,7 @@ use tokio::task::JoinError;
 mod cron;
 mod crypto;
 mod discovery;
+mod email;
 mod github;
 mod jobs;
 mod routes;
