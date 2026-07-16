@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pending_reviews (\n                    review_id, user_id, pr_url, pr_title, repo_name_with_owner,\n                    comment_count, last_comment_at, last_seen_at, is_backlog\n                )\n                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n                ON CONFLICT (review_id, user_id) DO UPDATE SET\n                    pr_url = EXCLUDED.pr_url,\n                    pr_title = EXCLUDED.pr_title,\n                    repo_name_with_owner = EXCLUDED.repo_name_with_owner,\n                    comment_count = EXCLUDED.comment_count,\n                    last_comment_at = EXCLUDED.last_comment_at,\n                    last_seen_at = EXCLUDED.last_seen_at,\n                    is_backlog = EXCLUDED.is_backlog",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Timestamptz",
+        "Timestamptz",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "84e6dca6f0a3731a5d86360a11ab45da05b78ed0ccebcefe27f51e0ff2556bb5"
+}

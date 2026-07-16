@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT review_id, is_backlog FROM pending_reviews WHERE user_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "review_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "is_backlog",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "f62528a2d396edd3e6449e91d3b1a6349de2bfe7bcf0027a781c887289efa80e"
+}
