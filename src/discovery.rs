@@ -84,10 +84,10 @@ pub fn is_stale(last_comment_at: DateTime<Utc>, threshold_hours: i32, now: DateT
 /// - Was backlog + still stale → stays backlog.
 /// - Was non-backlog → stays non-backlog (backlog only ever goes true→false).
 ///
-/// The service mirrors this exactly in SQL
-/// (`is_backlog = pending_reviews.is_backlog AND EXCLUDED.is_backlog`, where the
-/// excluded value is `stale_now`); the CLI calls this function against its state
-/// file. Keep the two in lockstep.
+/// Both callers resolve the flag *here* and then persist it verbatim: the
+/// service reads the prior flag, calls this, and writes `is_backlog =
+/// EXCLUDED.is_backlog`; the CLI does the same against its JSON state file. The
+/// rule has one home so the two can never drift.
 #[must_use]
 pub fn resolve_backlog(previous: Option<bool>, stale_now: bool) -> bool {
     match previous {
@@ -104,7 +104,14 @@ pub async fn discover_pending_reviews(
     access_token: &str,
     login: &str,
 ) -> Result<Vec<DiscoveredReview>> {
-    let search_q = format!("is:pr is:open involves:{login}");
+    // `sort:created-asc` makes pagination deterministic. It is a no-op for the
+    // common case (<1000 involved PRs → same set every sweep) but matters past
+    // the MAX_RESULTS ceiling: without a stable sort, search's default
+    // relevance order would surface a different arbitrary 1000 each sweep, and
+    // the reap would churn rows in and out — resetting first_seen_at and the
+    // backlog flag on genuinely-tracked reviews. Oldest-first also keeps the
+    // reviews most likely to be stale inside the covered window.
+    let search_q = format!("is:pr is:open involves:{login} sort:created-asc");
     let mut reviews = Vec::new();
     let mut after: Option<String> = None;
 
@@ -355,6 +362,15 @@ mod tests {
         }));
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].last_comment_at, ts("2026-07-11T08:00:00Z"));
+    }
+
+    #[test]
+    fn issue_nodes_contribute_no_reviews() {
+        // `search(type: ISSUE)` can return Issues alongside PRs. A non-PR node
+        // omits the inline-fragment fields entirely; `#[serde(default)]` gives
+        // it empty defaults (no reviews) rather than failing the page.
+        let reviews = parse_node(serde_json::json!({ "__typename": "Issue" }));
+        assert!(reviews.is_empty());
     }
 
     #[test]
