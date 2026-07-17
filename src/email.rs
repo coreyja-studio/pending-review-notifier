@@ -84,7 +84,7 @@ pub struct StdoutSender;
 #[async_trait]
 impl Mailer for StdoutSender {
     async fn send(&self, to: &str, subject: &str, html_body: &str) -> cja::Result<()> {
-        tracing::info!(to, subject, "Digest email (stdout sender):\n{html_body}");
+        tracing::info!(to, subject, "Reminder email (stdout sender):\n{html_body}");
         Ok(())
     }
 }
@@ -103,7 +103,7 @@ pub fn build_mailer(config: &crate::state::AppConfig, http: reqwest::Client) -> 
     }
 }
 
-/// Test double — captures sent emails for assertions in `SendDigest` tests.
+/// Test double — captures sent emails for assertions in `SendReminder` tests.
 #[cfg(test)]
 #[allow(dead_code)]
 pub struct CapturedEmail {

@@ -69,9 +69,7 @@ users
   refresh_token_enc    bytea not null
   token_expires_at     timestamptz not null
   email                text not null
-  timezone             text not null default 'UTC'   -- IANA, browser-detected at signup
-  digest_hour          int not null default 9
-  threshold_hours      int not null default 4
+  threshold_hours      int not null default 3
   status               text not null default 'active'  -- active | needs_reauth | paused
   reauth_notified_at   timestamptz                     -- "email once" on refresh failure
   created_at           timestamptz not null default now()
@@ -93,7 +91,7 @@ pending_reviews
   first_seen_at        timestamptz not null default now()
   last_seen_at         timestamptz not null     -- reap rows not seen in a sweep
   is_backlog           boolean not null         -- set on insert per the anti-flood rule
-  notified_at          timestamptz              -- last digest email that included this row
+  notified_at          timestamptz              -- last reminder email that included this row
   dismissed_at         timestamptz
   unique(review_id, user_id)
 ```
@@ -109,13 +107,17 @@ mapping table if needed for dashboard auth (see cja `Session` extractor).
   `last_seen_at` on all seen rows → reap rows not seen this sweep (delete; a submitted
   or discarded review is gone forever). Idempotent; the initial sync is the same job.
 - `SyncSweep` — cron every 30 min: enqueue `SyncUser` for every `status = 'active'` user.
-- `DigestSweep` — cron every 15 min: for each active user, compute their local hour via
-  their IANA timezone; if it equals `digest_hour` and no digest was sent in the last ~20h,
-  enqueue `SendDigest { user_id }`.
-- `SendDigest { user_id }` — select rows where `is_backlog = false`, `dismissed_at is
+- `ReminderSweep` — cron every 15 min: enqueue `SendReminder { user_id }` for every
+  `status = 'active'` user. No daily gating: a review is emailed at the first tick after
+  it crosses the threshold, so reminders land ~threshold_hours after the user's last
+  comment (which also tracks their working hours for free).
+- `SendReminder { user_id }` — select rows where `is_backlog = false`, `dismissed_at is
   null`, `now() - last_comment_at > threshold_hours`, and (`notified_at is null` or
-  `notified_at < now() - 7 days`) → send one email (cap 20 items) → stamp `notified_at`.
-  No qualifying rows → no email.
+  `notified_at < last_comment_at` — a comment newer than the last reminder starts a new
+  cycle — or `notified_at < now() - 7 days`) → send one email (cap 20 items) → stamp
+  `notified_at`.
+  No qualifying rows → no email; the `notified_at` dedup is what keeps the every-tick
+  enqueue quiet after a review has been reminded once.
 - cja cron gotchas: the `cron` crate uses **7-field** expressions (sec min hour dom mon
   dow year). A cron/job closure returning `Err` propagates up and **crashes the whole
   app** — wrap job bodies to log-and-continue instead of `?` at the top level.
@@ -146,8 +148,6 @@ refresh. No key rotation in v1.
   `github_user_id`, encrypt+store tokens, create session, enqueue initial `SyncUser`.
   If the user has no installations (`GET /user/installations`), show the install prompt.
   Handles `setup_action=install` identically (the param is informational).
-- Timezone: detected client-side at signup (`Intl.DateTimeFormat().resolvedOptions()
-  .timeZone`) posted with the login redirect or first dashboard load; override in settings.
 - `POST /disconnect` → `DELETE /applications/{client_id}/grant` (basic auth client_id:
   client_secret, body `{"access_token": ...}`) to revoke at GitHub, then delete user rows.
 
@@ -159,7 +159,7 @@ refresh. No key rotation in v1.
 | `GET /login`, `GET /callback` | OAuth |
 | `GET /dashboard` | Pending reviews + backlog, dismiss buttons |
 | `POST /dismiss/:id` | Dismiss a pending-review row |
-| `GET /settings` | Threshold, digest hour, timezone, coverage list, disconnect |
+| `GET /settings` | Threshold, coverage list, disconnect |
 | `POST /settings` | Update settings |
 | `POST /disconnect` | Revoke + delete |
 | `GET /healthz` | Liveness (version string) |

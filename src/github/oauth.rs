@@ -30,38 +30,17 @@ use uuid::Uuid;
 
 use crate::{github, session::PrnSession, state::AppState};
 
-/// Name of the (encrypted) cookie carrying the OAuth state and optional
-/// signup timezone, as `"{state}"` or `"{state}|{iana_tz}"`.
+/// Name of the (encrypted) cookie carrying the OAuth state.
 const STATE_COOKIE: &str = "oauth_state";
 
-#[derive(Deserialize)]
-pub struct LoginParams {
-    /// IANA timezone captured client-side; validated before use.
-    tz: Option<String>,
-}
-
 /// `GET /login` — set the state cookie and bounce to GitHub's authorize URL.
-pub async fn login(
-    State(state): State<AppState>,
-    Query(params): Query<LoginParams>,
-    jar: CookieJar<AppState>,
-) -> Response {
+pub async fn login(State(state): State<AppState>, jar: CookieJar<AppState>) -> Response {
     // 32 hex chars = 128 bits of CSRF entropy.
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     let oauth_state = hex::encode(bytes);
 
-    // Only carry a tz we can actually parse; anything else is dropped.
-    let tz = params
-        .tz
-        .as_deref()
-        .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok());
-    let cookie_value = match tz {
-        Some(tz) => format!("{oauth_state}|{tz}"),
-        None => oauth_state.clone(),
-    };
-
-    let cookie = Cookie::build((STATE_COOKIE, cookie_value))
+    let cookie = Cookie::build((STATE_COOKIE, oauth_state.clone()))
         .path("/")
         .http_only(true)
         .secure(true)
@@ -119,11 +98,7 @@ pub async fn callback(
     let Some(stored) = stored else {
         return (StatusCode::FORBIDDEN, "Missing or expired OAuth state").into_response();
     };
-    let stored_value = stored.value();
-    let (expected_state, tz) = match stored_value.split_once('|') {
-        Some((state, tz)) => (state, Some(tz.to_string())),
-        None => (stored_value, None),
-    };
+    let expected_state = stored.value();
 
     let state_matches = params
         .state
@@ -138,7 +113,7 @@ pub async fn callback(
         return (StatusCode::BAD_REQUEST, "Missing authorization code").into_response();
     };
 
-    match signed_in_response(&app_state, code, tz, &jar).await {
+    match signed_in_response(&app_state, code, &jar).await {
         Ok(response) => response,
         Err(err) => {
             // eyre reports here never contain token values.
@@ -152,7 +127,6 @@ pub async fn callback(
 async fn signed_in_response(
     state: &AppState,
     code: &str,
-    tz: Option<String>,
     jar: &CookieJar<AppState>,
 ) -> cja::Result<Response> {
     let tokens = exchange_code(state, code).await?;
@@ -168,10 +142,8 @@ async fn signed_in_response(
     // (Two truly concurrent FIRST sign-ins of the same account can race to a
     // unique violation; that 500 is a retry-once curiosity, not a lockout.)
     //
-    // The timezone is only taken from the login flow while the column still
-    // holds the default 'UTC' — a user-chosen timezone is never clobbered by
-    // a re-login. A re-login also clears needs_reauth (the user just proved
-    // they can auth), but leaves a deliberate 'paused' alone.
+    // A re-login clears needs_reauth (the user just proved they can auth),
+    // but leaves a deliberate 'paused' alone.
     let mut tx = state.db.begin().await?;
     let existing_user_id = sqlx::query_scalar!(
         "SELECT user_id FROM users WHERE github_user_id = $1 FOR UPDATE",
@@ -197,22 +169,17 @@ async fn signed_in_response(
                 access_token_enc = $3,
                 refresh_token_enc = $4,
                 token_expires_at = $5,
-                timezone = CASE
-                    WHEN timezone = 'UTC' THEN COALESCE($6::text, timezone)
-                    ELSE timezone
-                END,
                 status = CASE
                     WHEN status = 'needs_reauth' THEN 'active'
                     ELSE status
                 END
-            WHERE user_id = $7
+            WHERE user_id = $6
             "#,
             viewer.login,
             email,
             access_token_enc,
             refresh_token_enc,
             token_expires_at,
-            tz.as_deref(),
             user_id,
         )
         .execute(&mut *tx)
@@ -222,9 +189,9 @@ async fn signed_in_response(
             r#"
             INSERT INTO users (
                 user_id, github_login, github_user_id, access_token_enc,
-                refresh_token_enc, token_expires_at, email, timezone
+                refresh_token_enc, token_expires_at, email
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::text, 'UTC'))
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
             user_id,
             viewer.login,
@@ -233,7 +200,6 @@ async fn signed_in_response(
             refresh_token_enc,
             token_expires_at,
             email,
-            tz.as_deref(),
         )
         .execute(&mut *tx)
         .await?;
@@ -710,11 +676,7 @@ mod tests {
         let app = test_app(&state);
 
         let response = app
-            .oneshot(
-                Request::get("/login?tz=America/New_York")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/login").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -744,10 +706,9 @@ mod tests {
         assert!(set_cookie.contains("Secure"));
         assert!(set_cookie.contains("SameSite=Lax"));
         assert!(set_cookie.contains("Max-Age=600"));
-        // The private jar encrypts the value; neither the raw state nor the
-        // tz may appear in the wire cookie.
+        // The private jar encrypts the value; the raw state may not appear
+        // in the wire cookie.
         assert!(!set_cookie.contains(state_param.as_ref()));
-        assert!(!set_cookie.contains("America/New_York"));
     }
 
     #[tokio::test]
@@ -848,12 +809,12 @@ mod tests {
         .await;
         let app = test_app(&state);
 
-        let (oauth_state, cookies) = do_login(&app, "/login?tz=America/New_York").await;
+        let (oauth_state, cookies) = do_login(&app, "/login").await;
         let response = do_callback(&app, &oauth_state, &cookies).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(location(&response), "/dashboard");
 
-        // The user row: tokens stored encrypted (and decryptable), tz captured.
+        // The user row: tokens stored encrypted (and decryptable).
         let user = sqlx::query!("SELECT * FROM users")
             .fetch_one(&db)
             .await
@@ -861,7 +822,6 @@ mod tests {
         assert_eq!(user.github_login, "coreyja");
         assert_eq!(user.github_user_id, 12345);
         assert_eq!(user.email, "corey@example.com");
-        assert_eq!(user.timezone, "America/New_York");
         assert_eq!(user.status, "active");
         let aad = user.user_id.as_bytes();
         assert_eq!(
@@ -967,17 +927,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(location(&response), github::INSTALL_URL);
-
-        // Timezone defaults to UTC when the login link carried no tz.
-        let user = sqlx::query!("SELECT timezone FROM users")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(user.timezone, "UTC");
     }
 
     #[sqlx::test]
-    async fn relogin_does_not_clobber_user_chosen_timezone(db: PgPool) {
+    async fn relogin_rotates_tokens_and_clears_needs_reauth(db: PgPool) {
         let (state, mock) = mock_backed_state(db.clone()).await;
         mount_token_exchange(&mock).await;
         mount_user_endpoints(&mock).await;
@@ -986,14 +939,14 @@ mod tests {
 
         let user_id = insert_user(&state, "old_access", "old_refresh", Utc::now()).await;
         sqlx::query!(
-            "UPDATE users SET timezone = 'Europe/Berlin', status = 'needs_reauth' WHERE user_id = $1",
+            "UPDATE users SET status = 'needs_reauth' WHERE user_id = $1",
             user_id
         )
         .execute(&db)
         .await
         .unwrap();
 
-        let (oauth_state, cookies) = do_login(&app, "/login?tz=America/New_York").await;
+        let (oauth_state, cookies) = do_login(&app, "/login").await;
         let response = do_callback(&app, &oauth_state, &cookies).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
@@ -1001,10 +954,9 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        // Same user (upsert by github_user_id), fresh tokens, tz preserved,
-        // needs_reauth cleared by the successful re-auth.
+        // Same user (upsert by github_user_id), fresh tokens, needs_reauth
+        // cleared by the successful re-auth.
         assert_eq!(user.user_id, user_id);
-        assert_eq!(user.timezone, "Europe/Berlin");
         assert_eq!(user.status, "active");
         assert_eq!(
             state

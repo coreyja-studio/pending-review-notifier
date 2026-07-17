@@ -108,15 +108,15 @@ async fn landing() -> Markup {
                         p class="lede" {
                             "GitHub never reminds you about your own unsubmitted pending reviews — \
                             the comments you wrote but never clicked \"Submit\" on, invisible to \
-                            everyone but you. Pending Review Notifier watches for them and sends \
-                            you a daily digest when one has been sitting longer than your \
-                            threshold, so feedback stops silently rotting in draft."
+                            everyone but you. Pending Review Notifier watches for them and emails \
+                            you a reminder a few hours after your last comment, so feedback stops \
+                            silently rotting in draft."
                         }
                         div class="actions" {
                             a class="btn btn-primary" href="https://github.com/apps/pending-review-notifier" { "Install the GitHub App" }
-                            a class="btn" id="login-link" href="/login" { "Sign in" }
+                            a class="btn" href="/login" { "Sign in" }
                         }
-                        p class="fine" { "Free. At most one email a day. Nothing stored you can't delete." }
+                        p class="fine" { "Free. One reminder a few hours after you leave a review hanging. Nothing stored you can't delete." }
 
                         section class="group cli" {
                             header class="group-header" {
@@ -147,21 +147,8 @@ async fn landing() -> Markup {
                     }
                     (page_footer())
                 }
-                // Capture the browser timezone at signup: rewrite the sign-in
-                // link so /login can stash the tz in the OAuth state cookie.
-                script {
-                    (PreEscaped(r#"
-                    document.addEventListener('DOMContentLoaded', function () {
-                        try {
-                            var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                            var link = document.getElementById('login-link');
-                            if (tz && link) {
-                                link.href = '/login?tz=' + encodeURIComponent(tz);
-                            }
-                        } catch (e) { /* default of UTC applies */ }
-                    });
-                    "#))
-                }
+                // No scripts here on purpose: reminder timing is driven by
+                // when you comment, so there is no timezone to capture.
             }
         }
     }
@@ -337,14 +324,12 @@ async fn dismiss(
 struct SettingsForm {
     csrf: Option<String>,
     threshold_hours: i32,
-    digest_hour: i32,
-    timezone: String,
 }
 
 /// `GET /settings` — render a settings form pre-filled with the user's current values.
 async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, Response> {
     let user_row = sqlx::query!(
-        "SELECT threshold_hours, digest_hour, timezone FROM users WHERE user_id = $1",
+        "SELECT threshold_hours FROM users WHERE user_id = $1",
         user.user_id
     )
     .fetch_one(&state.db)
@@ -373,8 +358,6 @@ async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Ma
     Ok(settings_page(
         &user,
         &user_row.threshold_hours,
-        &user_row.digest_hour,
-        &user_row.timezone,
         &installations,
         None,
     ))
@@ -384,8 +367,6 @@ async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Ma
 fn settings_page(
     user: &CurrentUser,
     threshold_hours: &i32,
-    digest_hour: &i32,
-    timezone: &str,
     installations: &[SettingsInstallation],
     error: Option<&str>,
 ) -> Markup {
@@ -409,28 +390,7 @@ fn settings_page(
                                 label for="threshold_hours" { "Stale threshold" }
                                 input id="threshold_hours" type="number" name="threshold_hours"
                                     min="1" value=(threshold_hours);
-                                p class="hint" { "Hours since the last comment before a review counts as stale." }
-                            }
-                            div class="field" {
-                                label for="digest_hour" { "Digest hour" }
-                                select id="digest_hour" name="digest_hour" {
-                                    @for hour in 0..24 {
-                                        option value=(hour) selected[hour == *digest_hour] {
-                                            (format!("{hour:02}:00"))
-                                        }
-                                    }
-                                }
-                                p class="hint" { "Local hour the daily email goes out." }
-                            }
-                            div class="field" {
-                                label for="timezone" { "Timezone" }
-                                select id="timezone" name="timezone" {
-                                    @for tz in chrono_tz::TZ_VARIANTS {
-                                        option value=(tz.name()) selected[tz.name() == timezone] {
-                                            (tz.name())
-                                        }
-                                    }
-                                }
+                                p class="hint" { "Hours after your last comment before the reminder email goes out." }
                             }
                             button type="submit" class="btn btn-primary" { "Save" }
                         }
@@ -514,43 +474,15 @@ async fn update_settings(
         return Ok(settings_page(
             &user,
             &form.threshold_hours,
-            &form.digest_hour,
-            &form.timezone,
             &installations,
             Some("Threshold must be at least 1 hour."),
         )
         .into_response());
     }
 
-    if !(0..=23).contains(&form.digest_hour) {
-        return Ok(settings_page(
-            &user,
-            &form.threshold_hours,
-            &form.digest_hour,
-            &form.timezone,
-            &installations,
-            Some("Digest hour must be between 0 and 23."),
-        )
-        .into_response());
-    }
-
-    if form.timezone.parse::<chrono_tz::Tz>().is_err() {
-        return Ok(settings_page(
-            &user,
-            &form.threshold_hours,
-            &form.digest_hour,
-            &form.timezone,
-            &installations,
-            Some(&format!("Unknown timezone: {}", form.timezone)),
-        )
-        .into_response());
-    }
-
     sqlx::query!(
-        "UPDATE users SET threshold_hours = $1, digest_hour = $2, timezone = $3 WHERE user_id = $4",
+        "UPDATE users SET threshold_hours = $1 WHERE user_id = $2",
         form.threshold_hours,
-        form.digest_hour,
-        form.timezone,
         user.user_id
     )
     .execute(&state.db)
@@ -693,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn landing_returns_200_and_captures_tz() {
+    async fn landing_returns_200_with_reminder_copy_and_no_javascript() {
         let app = test_app(&lazy_test_state());
 
         let response = app
@@ -707,8 +639,11 @@ mod tests {
             .await
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("login-link"));
-        assert!(body.contains("Intl.DateTimeFormat().resolvedOptions().timeZone"));
+        assert!(body.contains("One reminder a few hours after you leave a review hanging"));
+        // The timezone-capture script is gone with the daily digest; the
+        // landing page ships zero JavaScript.
+        assert!(!body.contains("<script"));
+        assert!(!body.contains("Intl.DateTimeFormat"));
     }
 
     #[tokio::test]
@@ -1301,11 +1236,11 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
 
-        // Default values
+        // Threshold is the one remaining setting; the digest-era fields are gone.
         assert!(body.contains("threshold_hours"));
-        assert!(body.contains("digest_hour"));
-        assert!(body.contains("timezone"));
-        assert!(body.contains("UTC")); // default timezone
+        assert!(body.contains("value=\"3\"")); // default threshold
+        assert!(!body.contains("digest_hour"));
+        assert!(!body.contains("timezone"));
     }
 
     #[sqlx::test]
@@ -1324,56 +1259,18 @@ mod tests {
             .oneshot(post_form(
                 "/settings",
                 &session_cookies,
-                format!("csrf={csrf}&threshold_hours=8&digest_hour=14&timezone=America/New_York"),
+                format!("csrf={csrf}&threshold_hours=8"),
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(location(&response), "/settings");
 
-        let user = sqlx::query!("SELECT threshold_hours, digest_hour, timezone FROM users")
+        let user = sqlx::query!("SELECT threshold_hours FROM users")
             .fetch_one(&db)
             .await
             .unwrap();
         assert_eq!(user.threshold_hours, 8);
-        assert_eq!(user.digest_hour, 14);
-        assert_eq!(user.timezone, "America/New_York");
-    }
-
-    #[sqlx::test]
-    async fn settings_rejects_invalid_timezone(db: PgPool) {
-        let (state, mock) = mock_backed_state(db.clone()).await;
-        mount_token_exchange(&mock).await;
-        mount_user_endpoints(&mock).await;
-        mount_installations(&mock, serde_json::json!([])).await;
-        let app = test_app(&state);
-
-        let session_cookies = full_sign_in(&app, &db).await;
-        let csrf = csrf_hex(&db).await;
-
-        let response = app
-            .clone()
-            .oneshot(post_form(
-                "/settings",
-                &session_cookies,
-                format!("csrf={csrf}&threshold_hours=4&digest_hour=9&timezone=Not/A/Zone"),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Unknown timezone"));
-
-        // Values unchanged
-        let user = sqlx::query!("SELECT timezone FROM users")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(user.timezone, "UTC");
     }
 
     #[sqlx::test]
@@ -1392,7 +1289,7 @@ mod tests {
             .oneshot(post_form(
                 "/settings",
                 &session_cookies,
-                format!("csrf={csrf}&threshold_hours=0&digest_hour=9&timezone=UTC"),
+                format!("csrf={csrf}&threshold_hours=0"),
             ))
             .await
             .unwrap();
@@ -1409,42 +1306,7 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(user.threshold_hours, 4); // default
-    }
-
-    #[sqlx::test]
-    async fn settings_rejects_invalid_digest_hour(db: PgPool) {
-        let (state, mock) = mock_backed_state(db.clone()).await;
-        mount_token_exchange(&mock).await;
-        mount_user_endpoints(&mock).await;
-        mount_installations(&mock, serde_json::json!([])).await;
-        let app = test_app(&state);
-
-        let session_cookies = full_sign_in(&app, &db).await;
-        let csrf = csrf_hex(&db).await;
-
-        let response = app
-            .clone()
-            .oneshot(post_form(
-                "/settings",
-                &session_cookies,
-                format!("csrf={csrf}&threshold_hours=4&digest_hour=25&timezone=UTC"),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Digest hour must be between 0 and 23"));
-
-        let user = sqlx::query!("SELECT digest_hour FROM users")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(user.digest_hour, 9); // default
+        assert_eq!(user.threshold_hours, 3); // default
     }
 
     #[sqlx::test]
@@ -1462,7 +1324,7 @@ mod tests {
             .oneshot(post_form(
                 "/settings",
                 &session_cookies,
-                "threshold_hours=8&digest_hour=14&timezone=UTC".to_string(),
+                "threshold_hours=8".to_string(),
             ))
             .await
             .unwrap();
@@ -1473,6 +1335,6 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(user.threshold_hours, 4);
+        assert_eq!(user.threshold_hours, 3);
     }
 }

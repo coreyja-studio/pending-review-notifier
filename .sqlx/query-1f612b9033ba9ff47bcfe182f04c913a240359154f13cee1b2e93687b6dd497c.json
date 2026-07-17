@@ -40,37 +40,22 @@
       },
       {
         "ordinal": 7,
-        "name": "timezone",
-        "type_info": "Text"
-      },
-      {
-        "ordinal": 8,
-        "name": "digest_hour",
-        "type_info": "Int4"
-      },
-      {
-        "ordinal": 9,
         "name": "threshold_hours",
         "type_info": "Int4"
       },
       {
-        "ordinal": 10,
+        "ordinal": 8,
         "name": "status",
         "type_info": "Text"
       },
       {
-        "ordinal": 11,
+        "ordinal": 9,
         "name": "reauth_notified_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 10,
         "name": "created_at",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 13,
-        "name": "last_digest_at",
         "type_info": "Timestamptz"
       }
     ],
@@ -89,11 +74,8 @@
       false,
       false,
       false,
-      false,
-      false,
       true,
-      false,
-      true
+      false
     ]
   },
   "hash": "1f612b9033ba9ff47bcfe182f04c913a240359154f13cee1b2e93687b6dd497c"

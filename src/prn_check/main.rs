@@ -26,9 +26,9 @@ mod state_file;
 
 use state_file::{NOTIFY_DEDUP_DAYS, ReportItem, SweepOutcome};
 
-/// Matches the service default (`users.threshold_hours` defaults to 4,
+/// Matches the service default (`users.threshold_hours` defaults to 3,
 /// docs/DESIGN.md "Data model").
-const DEFAULT_THRESHOLD_HOURS: i32 = 4;
+const DEFAULT_THRESHOLD_HOURS: i32 = 3;
 
 /// GitHub requires a User-Agent on every API request.
 const USER_AGENT: &str = "prn-check (pending-review-notifier CLI)";
@@ -50,7 +50,7 @@ AUTH:
 
 OPTIONS:
     --threshold-hours <N>  Hours since the last activity on a pending review
-                           before it counts as stale (default: 4, the same
+                           before it counts as stale (default: 3, the same
                            default as the hosted service)
     --state-file <PATH>    Where to keep the local state
                            (default: $XDG_STATE_HOME/prn-check/state.json,
@@ -68,7 +68,8 @@ EXIT CODES:
 
 Reviews that are already stale the first time prn-check sees them are shown as
 backlog but never alert; only reviews it watches cross the threshold do. Once
-a review alerts, it will not alert again for 7 days.
+a review alerts, it will not alert again for 7 days — unless you comment on it
+again, which starts a new cycle.
 ";
 
 struct Args {
@@ -384,7 +385,7 @@ fn print_items(items: &[ReportItem], now: DateTime<Utc>) {
 }
 
 /// Human-readable age (e.g. "3d", "2w", "5h", "12m"), matching the service's
-/// digest email formatting.
+/// reminder email formatting.
 fn format_age(last_comment_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let elapsed = now - last_comment_at;
     if elapsed.num_days() >= 7 {
@@ -456,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn format_age_matches_the_digest_style() {
+    fn format_age_matches_the_reminder_email_style() {
         let now = DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);

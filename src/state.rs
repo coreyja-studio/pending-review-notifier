@@ -25,7 +25,7 @@ pub struct AppConfig {
     pub github_oauth_base: String,
     /// MailPace API token; when `None`, the [`StdoutSender`](crate::email::StdoutSender) is used.
     pub mailpace_token: Option<String>,
-    /// From-address for digest emails.
+    /// From-address for reminder emails.
     pub mail_from: String,
 }
 
@@ -169,7 +169,7 @@ pub mod test_support {
     }
 
     /// Same as [`test_state`] but with a custom mailer — the injection seam
-    /// for `CapturingSender` in `SendDigest` tests.
+    /// for `CapturingSender` in `SendReminder` tests.
     pub fn test_state_with_mailer(
         db: PgPool,
         config: AppConfig,

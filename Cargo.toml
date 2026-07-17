@@ -48,7 +48,6 @@ sqlx = { version = "0.8", default-features = false, features = [
   "json",
 ] }
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
-chrono-tz = "0.10"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 color-eyre = "0.6"
 tracing = "0.1"
