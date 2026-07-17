@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users SET\n                github_login = $1,\n                email = $2,\n                access_token_enc = $3,\n                refresh_token_enc = $4,\n                token_expires_at = $5,\n                status = CASE\n                    WHEN status = 'needs_reauth' THEN 'active'\n                    ELSE status\n                END\n            WHERE user_id = $6\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bytea",
+        "Bytea",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "da17dbca0861be583c263a379a0f7e43dd056eed34298e375a4737bf2f1fa4bd"
+}

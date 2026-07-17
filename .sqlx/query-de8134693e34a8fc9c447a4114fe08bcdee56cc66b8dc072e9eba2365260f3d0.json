@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT COUNT(*) FROM jobs WHERE name = 'SendDigest'",
+  "query": "SELECT COUNT(*) FROM jobs WHERE name = 'SendReminder'",
   "describe": {
     "columns": [
       {
@@ -16,5 +16,5 @@
       null
     ]
   },
-  "hash": "0e472d8c457f4c4e85f4e849a8a3e72844970e0b8b070ee7727bf53c6ffa9a94"
+  "hash": "de8134693e34a8fc9c447a4114fe08bcdee56cc66b8dc072e9eba2365260f3d0"
 }

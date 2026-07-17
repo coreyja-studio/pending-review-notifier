@@ -1,6 +1,5 @@
 use std::{convert::Infallible, time::Duration};
 
-use chrono::Timelike;
 use cja::{
     cron::{CronRegistry, Worker},
     jobs::{CancellationToken, Job as _},
@@ -11,14 +10,16 @@ use crate::{jobs::SyncUser, state::AppState};
 /// How often to fan out a sync across all active users.
 const SYNC_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-/// How often to check if any user's local hour matches their digest hour.
-const DIGEST_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// How often to check every user for reviews that newly crossed their
+/// staleness threshold. This is the reminder granularity: a review that
+/// crosses at 4:31pm is emailed by the ~4:45pm sweep.
+const REMINDER_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Build the cron registry.
 ///
 /// The closures are deliberately infallible (`Result<(), Infallible>`): a cron
 /// closure that returns `Err` propagates up and crashes the whole app, so
-/// [`sync_sweep`] and [`digest_sweep`] handle every error internally
+/// [`sync_sweep`] and [`reminder_sweep`] handle every error internally
 /// (log-and-continue) and the wrappers can only ever return `Ok`.
 fn registry() -> CronRegistry<AppState> {
     let mut registry = CronRegistry::new();
@@ -34,12 +35,12 @@ fn registry() -> CronRegistry<AppState> {
         },
     );
     registry.register(
-        "DigestSweep",
-        Some("Enqueue SendDigest for each active user at their local digest hour"),
-        DIGEST_SWEEP_INTERVAL,
+        "ReminderSweep",
+        Some("Enqueue SendReminder for every active user"),
+        REMINDER_SWEEP_INTERVAL,
         |state, _ctx| {
             Box::pin(async move {
-                digest_sweep(state).await;
+                reminder_sweep(state).await;
                 Ok::<(), Infallible>(())
             })
         },
@@ -75,66 +76,38 @@ async fn sync_sweep(state: AppState) {
     tracing::info!(active_users = total, "SyncSweep enqueued");
 }
 
-/// For each active user, compute their local hour via their IANA timezone. If
-/// it equals their `digest_hour` and no digest was sent in ~20h, enqueue a
-/// [`SendDigest`](crate::jobs::SendDigest) job. Never returns an error: all
-/// failures are logged and the sweep continues.
-async fn digest_sweep(state: AppState) {
-    let users = match sqlx::query!(
-        "SELECT user_id, timezone, digest_hour, last_digest_at
-         FROM users WHERE status = 'active'"
-    )
-    .fetch_all(&state.db)
-    .await
+/// Enqueue a [`SendReminder`](crate::jobs::SendReminder) job for every active
+/// user. The job itself decides whether anything newly crossed the threshold
+/// (and sends nothing otherwise), so the eligibility SQL lives in exactly one
+/// place; most ticks are quiet no-ops. Never returns an error: all failures
+/// are logged and the sweep continues.
+async fn reminder_sweep(state: AppState) {
+    let user_ids = match sqlx::query_scalar!("SELECT user_id FROM users WHERE status = 'active'")
+        .fetch_all(&state.db)
+        .await
     {
-        Ok(users) => users,
+        Ok(ids) => ids,
         Err(error) => {
-            tracing::error!(?error, "DigestSweep: failed to list active users");
+            tracing::error!(?error, "ReminderSweep: failed to list active users");
             return;
         }
     };
 
-    let now = chrono::Utc::now();
-    for user in users {
-        let Ok(tz) = user.timezone.parse::<chrono_tz::Tz>() else {
-            tracing::warn!(
-                user_id = %user.user_id,
-                timezone = %user.timezone,
-                "DigestSweep: invalid timezone, skipping user"
-            );
-            continue;
-        };
-
-        let local_hour = now.with_timezone(&tz).hour();
-        let hour_matches = u32::try_from(user.digest_hour)
-            .map(|h| h == local_hour)
-            .unwrap_or(false);
-        if !hour_matches {
-            continue;
-        }
-
-        let should_send = user
-            .last_digest_at
-            .is_none_or(|t| now - t > chrono::Duration::hours(20));
-        if !should_send {
-            continue;
-        }
-
-        if let Err(error) = (crate::jobs::SendDigest {
-            user_id: user.user_id,
-        })
-        .enqueue(state.clone(), "digest_sweep".to_string(), None)
-        .await
+    let total = user_ids.len();
+    for user_id in user_ids {
+        if let Err(error) = (crate::jobs::SendReminder { user_id })
+            .enqueue(state.clone(), "reminder_sweep".to_string(), None)
+            .await
         {
             tracing::error!(
                 ?error,
-                user_id = %user.user_id,
-                "DigestSweep: failed to enqueue SendDigest"
+                %user_id,
+                "ReminderSweep: failed to enqueue SendReminder"
             );
         }
     }
 
-    tracing::info!("DigestSweep completed");
+    tracing::info!(active_users = total, "ReminderSweep enqueued");
 }
 
 pub async fn run_cron(app_state: AppState, shutdown_token: CancellationToken) -> cja::Result<()> {
@@ -159,27 +132,20 @@ mod tests {
     use super::*;
     use crate::state::test_support::{test_config, test_state};
 
-    async fn insert_active_user(
-        db: &PgPool,
-        timezone: &str,
-        digest_hour: i32,
-        last_digest_at: Option<chrono::DateTime<Utc>>,
-    ) -> Uuid {
+    async fn insert_active_user(db: &PgPool, github_user_id: i64) -> Uuid {
         let state = test_state(db.clone(), test_config());
         let user_id = Uuid::new_v4();
         sqlx::query!(
             "INSERT INTO users (
                 user_id, github_login, github_user_id, access_token_enc,
-                refresh_token_enc, token_expires_at, email, timezone, digest_hour, last_digest_at
+                refresh_token_enc, token_expires_at, email
             )
-            VALUES ($1, 'test', 12345, $2, $3, $4, 'test@example.com', $5, $6, $7)",
+            VALUES ($1, 'test', $2, $3, $4, $5, 'test@example.com')",
             user_id,
+            github_user_id,
             state.crypto.encrypt("tok", user_id.as_bytes()).unwrap(),
             state.crypto.encrypt("ref", user_id.as_bytes()).unwrap(),
             Utc::now() + Duration::days(30),
-            timezone,
-            digest_hour,
-            last_digest_at,
         )
         .execute(db)
         .await
@@ -188,115 +154,48 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn digest_sweep_enqueues_for_matching_hour(db: PgPool) {
+    async fn reminder_sweep_enqueues_for_every_active_user(db: PgPool) {
         let state = test_state(db.clone(), test_config());
-        let current_hour = Utc::now().hour() as i32;
-        insert_active_user(&db, "UTC", current_hour, None).await;
+        insert_active_user(&db, 1).await;
+        insert_active_user(&db, 2).await;
 
-        digest_sweep(state).await;
+        reminder_sweep(state).await;
 
-        let job_count = sqlx::query_scalar!("SELECT COUNT(*) FROM jobs WHERE name = 'SendDigest'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(job_count, Some(1));
+        let job_count =
+            sqlx::query_scalar!("SELECT COUNT(*) FROM jobs WHERE name = 'SendReminder'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(job_count, Some(2));
     }
 
     #[sqlx::test]
-    async fn digest_sweep_skips_non_matching_hour(db: PgPool) {
+    async fn reminder_sweep_skips_inactive_users(db: PgPool) {
         let state = test_state(db.clone(), test_config());
-        let current_hour = Utc::now().hour() as i32;
-        let non_matching_hour = if current_hour == 0 { 1 } else { 0 };
-        insert_active_user(&db, "UTC", non_matching_hour, None).await;
-
-        digest_sweep(state).await;
-
-        let job_count = sqlx::query_scalar!("SELECT COUNT(*) FROM jobs WHERE name = 'SendDigest'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(job_count, Some(0));
-    }
-
-    #[sqlx::test]
-    async fn digest_sweep_skips_recently_sent(db: PgPool) {
-        let state = test_state(db.clone(), test_config());
-        let current_hour = Utc::now().hour() as i32;
-        // Just sent a digest 1 hour ago — within the 20h window
-        insert_active_user(
-            &db,
-            "UTC",
-            current_hour,
-            Some(Utc::now() - Duration::hours(1)),
-        )
-        .await;
-
-        digest_sweep(state).await;
-
-        let job_count = sqlx::query_scalar!("SELECT COUNT(*) FROM jobs WHERE name = 'SendDigest'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(job_count, Some(0));
-    }
-
-    #[sqlx::test]
-    async fn digest_sweep_sends_after_20h(db: PgPool) {
-        let state = test_state(db.clone(), test_config());
-        let current_hour = Utc::now().hour() as i32;
-        // Last digest was 21 hours ago — past the 20h window
-        insert_active_user(
-            &db,
-            "UTC",
-            current_hour,
-            Some(Utc::now() - Duration::hours(21)),
-        )
-        .await;
-
-        digest_sweep(state).await;
-
-        let job_count = sqlx::query_scalar!("SELECT COUNT(*) FROM jobs WHERE name = 'SendDigest'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(job_count, Some(1));
-    }
-
-    #[sqlx::test]
-    async fn digest_sweep_skips_inactive_users(db: PgPool) {
-        let state = test_state(db.clone(), test_config());
-        let current_hour = Utc::now().hour() as i32;
-        let user_id = insert_active_user(&db, "UTC", current_hour, None).await;
+        let paused = insert_active_user(&db, 1).await;
         sqlx::query!(
             "UPDATE users SET status = 'paused' WHERE user_id = $1",
-            user_id
+            paused
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let needs_reauth = insert_active_user(&db, 2).await;
+        sqlx::query!(
+            "UPDATE users SET status = 'needs_reauth' WHERE user_id = $1",
+            needs_reauth
         )
         .execute(&db)
         .await
         .unwrap();
 
-        digest_sweep(state).await;
+        reminder_sweep(state).await;
 
-        let job_count = sqlx::query_scalar!("SELECT COUNT(*) FROM jobs WHERE name = 'SendDigest'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(job_count, Some(0));
-    }
-
-    #[sqlx::test]
-    async fn digest_sweep_skips_invalid_timezone(db: PgPool) {
-        let state = test_state(db.clone(), test_config());
-        let current_hour = Utc::now().hour() as i32;
-        insert_active_user(&db, "Not/A/Zone", current_hour, None).await;
-
-        // Should not panic
-        digest_sweep(state).await;
-
-        let job_count = sqlx::query_scalar!("SELECT COUNT(*) FROM jobs WHERE name = 'SendDigest'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let job_count =
+            sqlx::query_scalar!("SELECT COUNT(*) FROM jobs WHERE name = 'SendReminder'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(job_count, Some(0));
     }
 }

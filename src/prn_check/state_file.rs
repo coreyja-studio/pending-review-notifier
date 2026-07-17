@@ -5,7 +5,7 @@
 //! the service can never drift: staleness via [`discovery::is_stale`], the
 //! anti-flood backlog rule via [`discovery::resolve_backlog`]. This module adds
 //! only persistence and the 7-day notified-at dedup — the same rules the
-//! service's `SyncUser`/`SendDigest` jobs apply against Postgres.
+//! service's `SyncUser`/`SendReminder` jobs apply against Postgres.
 //!
 //! [`apply_sweep`] is pure (state in, state out, injected `now`), so the whole
 //! transition machine is testable without a network or filesystem.
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::{self, DiscoveredReview};
 
-/// Per-review re-alert window, matching the service's `SendDigest` dedup
+/// Per-review re-alert window, matching the service's `SendReminder` dedup
 /// (`notified_at IS NULL OR notified_at < now() - interval '7 days'`).
 pub const NOTIFY_DEDUP_DAYS: i64 = 7;
 
@@ -126,7 +126,7 @@ pub fn save(state: &StateFile, path: &Path) -> Result<()> {
 }
 
 /// Apply one sweep of discovered reviews to the state, mirroring the service's
-/// `SyncUser` (upsert + backlog rule + reap) and `SendDigest` (staleness +
+/// `SyncUser` (upsert + backlog rule + reap) and `SendReminder` (staleness +
 /// dedup + `notified_at` stamp) in a single pass:
 ///
 /// - staleness: strict greater-than via [`discovery::is_stale`]
@@ -190,7 +190,7 @@ pub fn apply_sweep(
     // discarded), so it leaves the state file too.
     state.reviews = next;
 
-    // Oldest-first within each section, matching the digest's ORDER BY
+    // Oldest-first within each section, matching the reminder email's ORDER BY
     // last_comment_at ASC; review_id breaks ties deterministically.
     for list in [
         &mut outcome.newly_actionable,

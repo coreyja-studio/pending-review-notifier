@@ -122,12 +122,16 @@ impl Job<AppState> for SyncUser {
     }
 }
 
-cja::impl_job_registry!(AppState, SyncUser, SendDigest);
+// NB: cja's job worker looks up handlers by the NAME string. Renaming
+// SendDigest → SendReminder orphans any `SendDigest` rows still enqueued at
+// deploy time — accepted: they only ever exist within one 15-minute sweep
+// window, and the next ReminderSweep re-covers the same reviews.
+cja::impl_job_registry!(AppState, SyncUser, SendReminder);
 
-/// A pending-review row selected for the digest email.
+/// A pending-review row selected for the reminder email.
 ///
 /// All columns are `NOT NULL`, so fields are non-`Option`.
-struct DigestReviewRow {
+struct ReminderReviewRow {
     id: Uuid,
     pr_title: String,
     repo_name_with_owner: String,
@@ -136,28 +140,33 @@ struct DigestReviewRow {
     last_comment_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Send a digest email for a user's email-eligible pending reviews.
+/// Send a reminder email for a user's email-eligible pending reviews.
+///
+/// Enqueued for every active user each 15-minute `ReminderSweep` tick, so a
+/// review is emailed at the first tick after it crosses the threshold — with a
+/// 3h threshold, a comment at 2pm means a reminder at ~5pm. No daily gating:
+/// the timing follows when the user actually left comments.
 ///
 /// Selects rows where `is_backlog = false`, `dismissed_at IS NULL`, the staleness
 /// threshold is exceeded (strict `>`, matching `discovery::is_stale`), and the
-/// per-review dedup (`notified_at`) allows re-nagging after 7 days.
+/// per-review dedup (`notified_at`) allows re-nagging after 7 days. That dedup
+/// is also what makes the every-tick enqueue safe: once a review is emailed,
+/// the next tick's run selects nothing and sends nothing.
 ///
-/// If no rows match, sends nothing and does NOT stamp `last_digest_at` — a quiet
-/// morning doesn't suppress a later digest. If rows match, sends ONE email
-/// (capped at 20 items), stamps `notified_at` on each, and stamps
-/// `users.last_digest_at`.
+/// If rows match, sends ONE email per user per tick (batching everything that
+/// newly qualified, capped at 20 items) and stamps `notified_at` on each.
 ///
 /// Retry semantics: if the job dies after `mailer.send` but before the stamps,
 /// a retry re-sends (duplicate email) — accepted (a dup beats a miss). Job
 /// `Err` is caught by the worker (retry/backoff), never crashes the app.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SendDigest {
+pub struct SendReminder {
     pub user_id: Uuid,
 }
 
 #[async_trait::async_trait]
-impl Job<AppState> for SendDigest {
-    const NAME: &'static str = "SendDigest";
+impl Job<AppState> for SendReminder {
+    const NAME: &'static str = "SendReminder";
 
     async fn run(&self, state: AppState) -> cja::Result<()> {
         let Some(user) = sqlx::query!(
@@ -171,7 +180,7 @@ impl Job<AppState> for SendDigest {
         };
 
         let reviews = sqlx::query_as!(
-            DigestReviewRow,
+            ReminderReviewRow,
             "SELECT id, pr_title, repo_name_with_owner, pr_url, comment_count, last_comment_at
              FROM pending_reviews
              WHERE user_id = $1
@@ -193,12 +202,12 @@ impl Job<AppState> for SendDigest {
 
         // Honest subject: the count and the fact, no brackets, no decoration.
         let subject = if reviews.len() == 1 {
-            "1 pending review is stale".to_string()
+            "1 pending review needs a nudge".to_string()
         } else {
-            format!("{} pending reviews are stale", reviews.len())
+            format!("{} pending reviews need a nudge", reviews.len())
         };
 
-        let html_body = render_digest_email(&reviews, user.threshold_hours);
+        let html_body = render_reminder_email(&reviews, user.threshold_hours);
         state.mailer.send(&user.email, &subject, &html_body).await?;
 
         let ids: Vec<Uuid> = reviews.iter().map(|r| r.id).collect();
@@ -208,17 +217,11 @@ impl Job<AppState> for SendDigest {
         )
         .execute(&state.db)
         .await?;
-        sqlx::query!(
-            "UPDATE users SET last_digest_at = now() WHERE user_id = $1",
-            self.user_id
-        )
-        .execute(&state.db)
-        .await?;
 
         tracing::info!(
             user_id = %self.user_id,
             review_count = reviews.len(),
-            "SendDigest: email sent"
+            "SendReminder: email sent"
         );
 
         Ok(())
@@ -244,26 +247,26 @@ fn format_age(last_comment_at: chrono::DateTime<chrono::Utc>) -> String {
 const EMAIL_FONT: &str =
     "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif";
 
-/// Render the digest email HTML body. Table-based layout, all styles inline.
+/// Render the reminder email HTML body. Table-based layout, all styles inline.
 /// Auto-escaped text (no `PreEscaped` on `pr_title`/`repo_name_with_owner`).
 ///
 /// Dark-mode tolerance: explicit `color-scheme` metas, no `background-color`
 /// anywhere (the client supplies it), no pure #000/#fff, and a bordered — not
 /// filled — CTA so forced inversion can't produce black-on-black.
-fn render_digest_email(reviews: &[DigestReviewRow], threshold_hours: i32) -> String {
+fn render_reminder_email(reviews: &[ReminderReviewRow], threshold_hours: i32) -> String {
     let lede = if reviews.len() == 1 {
-        "1 pending review has gone stale.".to_string()
+        "You left a pending review hanging.".to_string()
     } else {
-        format!("{} pending reviews have gone stale.", reviews.len())
+        format!("You left {} pending reviews hanging.", reviews.len())
     };
     // Rows are ordered oldest-first, so the first row is the preheader's hook.
     let preheader = reviews.first().map(|oldest| {
         format!(
             "{} — oldest: {}, {}.",
             if reviews.len() == 1 {
-                "1 pending review is stale".to_string()
+                "1 pending review needs a nudge".to_string()
             } else {
-                format!("{} pending reviews are stale", reviews.len())
+                format!("{} pending reviews need a nudge", reviews.len())
             },
             oldest.repo_name_with_owner,
             format_age(oldest.last_comment_at),
@@ -330,8 +333,8 @@ fn render_digest_email(reviews: &[DigestReviewRow], threshold_hours: i32) -> Str
                                 }
                                 tr {
                                     td style=(format!("font-family: {EMAIL_FONT}; font-size: 13px; line-height: 1.4; color: #8a8a8a; padding: 16px 0 0; border-top: 1px solid #d4d4d4;")) {
-                                        "You get this because a pending review crossed your "
-                                        (threshold_hours) "h threshold. Change the threshold or unsubscribe in "
+                                        "You get this because a pending review sat untouched for more than "
+                                        (threshold_hours) " hours after your last comment. Change the threshold or unsubscribe in "
                                         a href="https://prn.coreyja.studio/settings" style="color: #8a8a8a;" { "Settings" }
                                         "."
                                     }
@@ -581,9 +584,9 @@ mod tests {
         assert_eq!(remaining, vec!["R1".to_string()], "R2 reaped, R1 kept");
     }
 
-    // --- SendDigest tests ---
+    // --- SendReminder tests ---
 
-    async fn insert_user_for_digest(db: &PgPool, threshold_hours: i32) -> Uuid {
+    async fn insert_user_for_reminder(db: &PgPool, threshold_hours: i32) -> Uuid {
         let state = test_state(db.clone(), test_config());
         let user_id = Uuid::new_v4();
         sqlx::query!(
@@ -605,7 +608,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn insert_digest_review(
+    async fn insert_reminder_review(
         db: &PgPool,
         user_id: Uuid,
         review_id: &str,
@@ -642,17 +645,17 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn send_digest_emails_eligible_reviews(db: PgPool) {
+    async fn send_reminder_emails_eligible_reviews(db: PgPool) {
         let capturing = Arc::new(crate::email::CapturingSender::default());
         let state = crate::state::test_support::test_state_with_mailer(
             db.clone(),
             test_config(),
             capturing.clone(),
         );
-        let user_id = insert_user_for_digest(&db, 4).await;
+        let user_id = insert_user_for_reminder(&db, 4).await;
 
         // Eligible: stale (5h > 4h), not backlog, not dismissed, not notified
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R1",
@@ -664,7 +667,7 @@ mod tests {
         )
         .await;
         // Ineligible: not stale (1h < 4h)
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R2",
@@ -676,7 +679,7 @@ mod tests {
         )
         .await;
 
-        SendDigest { user_id }.run(state).await.unwrap();
+        SendReminder { user_id }.run(state).await.unwrap();
 
         {
             let sent = capturing.sent.lock().unwrap();
@@ -699,30 +702,53 @@ mod tests {
                 .await
                 .unwrap();
         assert!(notified_r2.is_none());
-
-        // last_digest_at stamped
-        let last_digest: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
-            "SELECT last_digest_at FROM users WHERE user_id = $1",
-            user_id
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert!(last_digest.is_some());
     }
 
     #[sqlx::test]
-    async fn send_digest_staleness_boundary(db: PgPool) {
+    async fn send_reminder_second_tick_does_not_re_email(db: PgPool) {
         let capturing = Arc::new(crate::email::CapturingSender::default());
         let state = crate::state::test_support::test_state_with_mailer(
             db.clone(),
             test_config(),
             capturing.clone(),
         );
-        let user_id = insert_user_for_digest(&db, 4).await;
+        let user_id = insert_user_for_reminder(&db, 3).await;
+
+        // A review that crossed the threshold between ticks: emailed once by
+        // the first run, then the notified_at dedup keeps every subsequent
+        // tick quiet.
+        insert_reminder_review(
+            &db,
+            user_id,
+            "R1",
+            "Crossed between ticks",
+            Utc::now() - Duration::hours(4),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        SendReminder { user_id }.run(state.clone()).await.unwrap();
+        SendReminder { user_id }.run(state).await.unwrap();
+
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "second tick must not re-email");
+        assert!(sent[0].html_body.contains("Crossed between ticks"));
+    }
+
+    #[sqlx::test]
+    async fn send_reminder_staleness_boundary(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_reminder(&db, 4).await;
 
         // Just under threshold (4h - 1s) → NOT eligible (strict >)
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R_AT",
@@ -734,7 +760,7 @@ mod tests {
         )
         .await;
         // Just past threshold → eligible
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R_PAST",
@@ -746,7 +772,7 @@ mod tests {
         )
         .await;
 
-        SendDigest { user_id }.run(state).await.unwrap();
+        SendReminder { user_id }.run(state).await.unwrap();
 
         let sent = capturing.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -755,17 +781,17 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn send_digest_per_review_dedup(db: PgPool) {
+    async fn send_reminder_per_review_dedup(db: PgPool) {
         let capturing = Arc::new(crate::email::CapturingSender::default());
         let state = crate::state::test_support::test_state_with_mailer(
             db.clone(),
             test_config(),
             capturing.clone(),
         );
-        let user_id = insert_user_for_digest(&db, 4).await;
+        let user_id = insert_user_for_reminder(&db, 4).await;
 
         // notified_at < 7 days ago → excluded
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R_RECENT",
@@ -777,7 +803,7 @@ mod tests {
         )
         .await;
         // notified_at > 7 days ago → included
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R_OLD",
@@ -789,7 +815,7 @@ mod tests {
         )
         .await;
 
-        SendDigest { user_id }.run(state).await.unwrap();
+        SendReminder { user_id }.run(state).await.unwrap();
 
         let sent = capturing.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -798,17 +824,17 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn send_digest_excludes_backlog_and_dismissed(db: PgPool) {
+    async fn send_reminder_excludes_backlog_and_dismissed(db: PgPool) {
         let capturing = Arc::new(crate::email::CapturingSender::default());
         let state = crate::state::test_support::test_state_with_mailer(
             db.clone(),
             test_config(),
             capturing.clone(),
         );
-        let user_id = insert_user_for_digest(&db, 4).await;
+        let user_id = insert_user_for_reminder(&db, 4).await;
 
         // Backlog → excluded
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R_BACK",
@@ -820,7 +846,7 @@ mod tests {
         )
         .await;
         // Dismissed → excluded
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R_DISM",
@@ -832,7 +858,7 @@ mod tests {
         )
         .await;
         // Eligible
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R_OK",
@@ -844,7 +870,7 @@ mod tests {
         )
         .await;
 
-        SendDigest { user_id }.run(state).await.unwrap();
+        SendReminder { user_id }.run(state).await.unwrap();
 
         let sent = capturing.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -854,17 +880,17 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn send_digest_caps_at_20(db: PgPool) {
+    async fn send_reminder_caps_at_20(db: PgPool) {
         let capturing = Arc::new(crate::email::CapturingSender::default());
         let state = crate::state::test_support::test_state_with_mailer(
             db.clone(),
             test_config(),
             capturing.clone(),
         );
-        let user_id = insert_user_for_digest(&db, 4).await;
+        let user_id = insert_user_for_reminder(&db, 4).await;
 
         for i in 0..25 {
-            insert_digest_review(
+            insert_reminder_review(
                 &db,
                 user_id,
                 &format!("R{}", i),
@@ -877,7 +903,7 @@ mod tests {
             .await;
         }
 
-        SendDigest { user_id }.run(state).await.unwrap();
+        SendReminder { user_id }.run(state).await.unwrap();
 
         {
             let sent = capturing.sent.lock().unwrap();
@@ -899,17 +925,17 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn send_digest_no_eligible_no_email(db: PgPool) {
+    async fn send_reminder_no_eligible_no_email(db: PgPool) {
         let capturing = Arc::new(crate::email::CapturingSender::default());
         let state = crate::state::test_support::test_state_with_mailer(
             db.clone(),
             test_config(),
             capturing.clone(),
         );
-        let user_id = insert_user_for_digest(&db, 4).await;
+        let user_id = insert_user_for_reminder(&db, 4).await;
 
         // Only fresh review → not eligible
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R1",
@@ -921,33 +947,21 @@ mod tests {
         )
         .await;
 
-        SendDigest { user_id }.run(state).await.unwrap();
+        SendReminder { user_id }.run(state).await.unwrap();
 
-        {
-            let sent = capturing.sent.lock().unwrap();
-            assert_eq!(sent.len(), 0);
-        }
-
-        // last_digest_at NOT stamped on quiet morning
-        let last_digest: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
-            "SELECT last_digest_at FROM users WHERE user_id = $1",
-            user_id
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert!(last_digest.is_none());
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 0);
     }
 
     #[sqlx::test]
-    async fn send_digest_skips_inactive_user(db: PgPool) {
+    async fn send_reminder_skips_inactive_user(db: PgPool) {
         let capturing = Arc::new(crate::email::CapturingSender::default());
         let state = crate::state::test_support::test_state_with_mailer(
             db.clone(),
             test_config(),
             capturing.clone(),
         );
-        let user_id = insert_user_for_digest(&db, 4).await;
+        let user_id = insert_user_for_reminder(&db, 4).await;
         sqlx::query!(
             "UPDATE users SET status = 'paused' WHERE user_id = $1",
             user_id
@@ -956,7 +970,7 @@ mod tests {
         .await
         .unwrap();
 
-        insert_digest_review(
+        insert_reminder_review(
             &db,
             user_id,
             "R1",
@@ -968,7 +982,7 @@ mod tests {
         )
         .await;
 
-        SendDigest { user_id }.run(state).await.unwrap();
+        SendReminder { user_id }.run(state).await.unwrap();
 
         let sent = capturing.sent.lock().unwrap();
         assert_eq!(sent.len(), 0);

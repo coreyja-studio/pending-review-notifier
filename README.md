@@ -1,8 +1,9 @@
 # Pending Review Notifier
 
 GitHub lets you leave review comments on a PR without submitting the review — they sit
-PENDING, visible only to you, forever. This service notices and emails you when a *new*
-pending review goes stale, and shows the whole backlog on a dashboard.
+PENDING, visible only to you, forever. This service notices and emails you a reminder a
+few hours after your last comment when a *new* pending review goes stale (default: 3
+hours), and shows the whole backlog on a dashboard.
 
 Distributed as a GitHub App: install, connect, done.
 
@@ -65,7 +66,7 @@ Backlog (2; already stale when first seen, never alerts):
   ...
 ```
 
-- `--threshold-hours <N>` — staleness threshold (default 4, same as the service)
+- `--threshold-hours <N>` — staleness threshold (default 3, same as the service)
 - `--state-file <PATH>` — state location (default `$XDG_STATE_HOME/prn-check/state.json`,
   falling back to `~/.local/state/prn-check/state.json`)
 - `--login <LOGIN>` — GitHub login to check (default: whoever the token belongs to)
