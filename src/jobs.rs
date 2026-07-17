@@ -191,11 +191,15 @@ impl Job<AppState> for SendDigest {
             return Ok(());
         }
 
-        let html_body = render_digest_email(&reviews);
-        state
-            .mailer
-            .send(&user.email, "Your pending reviews", &html_body)
-            .await?;
+        // Honest subject: the count and the fact, no brackets, no decoration.
+        let subject = if reviews.len() == 1 {
+            "1 pending review is stale".to_string()
+        } else {
+            format!("{} pending reviews are stale", reviews.len())
+        };
+
+        let html_body = render_digest_email(&reviews, user.threshold_hours);
+        state.mailer.send(&user.email, &subject, &html_body).await?;
 
         let ids: Vec<Uuid> = reviews.iter().map(|r| r.id).collect();
         sqlx::query!(
@@ -235,37 +239,106 @@ fn format_age(last_comment_at: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// Render the digest email HTML body. Inline styles only (email clients strip
-/// `<style>`/external CSS). Auto-escaped text (no `PreEscaped` on
-/// `pr_title`/`repo_name_with_owner`).
-fn render_digest_email(reviews: &[DigestReviewRow]) -> String {
+/// Email-safe font stack, repeated inline on every text-bearing element
+/// (email clients strip `<style>`/external CSS).
+const EMAIL_FONT: &str =
+    "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif";
+
+/// Render the digest email HTML body. Table-based layout, all styles inline.
+/// Auto-escaped text (no `PreEscaped` on `pr_title`/`repo_name_with_owner`).
+///
+/// Dark-mode tolerance: explicit `color-scheme` metas, no `background-color`
+/// anywhere (the client supplies it), no pure #000/#fff, and a bordered — not
+/// filled — CTA so forced inversion can't produce black-on-black.
+fn render_digest_email(reviews: &[DigestReviewRow], threshold_hours: i32) -> String {
+    let lede = if reviews.len() == 1 {
+        "1 pending review has gone stale.".to_string()
+    } else {
+        format!("{} pending reviews have gone stale.", reviews.len())
+    };
+    // Rows are ordered oldest-first, so the first row is the preheader's hook.
+    let preheader = reviews.first().map(|oldest| {
+        format!(
+            "{} — oldest: {}, {}.",
+            if reviews.len() == 1 {
+                "1 pending review is stale".to_string()
+            } else {
+                format!("{} pending reviews are stale", reviews.len())
+            },
+            oldest.repo_name_with_owner,
+            format_age(oldest.last_comment_at),
+        )
+    });
+
     html! {
         (DOCTYPE)
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Your pending reviews" }
+                meta name="color-scheme" content="light dark";
+                meta name="supported-color-schemes" content="light dark";
+                title { "Pending Review Notifier" }
             }
-            body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 16px;" {
-                h1 { "Pending Review Notifier" }
-                p { "You have pending reviews that have been sitting for a while:" }
-                ul {
-                    @for review in reviews {
-                        li style="margin-bottom: 12px;" {
-                            a href=(format!("{}/files", review.pr_url))
-                                style="font-weight: bold;" { (review.pr_title) }
-                            " — " (review.repo_name_with_owner)
-                            " (" (review.comment_count) " comments, "
-                            (format_age(review.last_comment_at)) " old)"
+            body style="margin: 0; padding: 0;" {
+                @if let Some(preheader) = preheader {
+                    div style="display: none; max-height: 0; overflow: hidden;" { (preheader) }
+                }
+                table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                    style="border-collapse: collapse; border-top: 6px solid #1a1a1a;" {
+                    tr {
+                        td align="center" style="padding: 24px 16px 40px;" {
+                            table role="presentation" cellpadding="0" cellspacing="0"
+                                style="border-collapse: collapse; max-width: 560px; width: 100%;" {
+                                tr {
+                                    td style=(format!("font-family: {EMAIL_FONT}; font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #595959; padding: 0 0 16px;")) {
+                                        "Pending Review Notifier"
+                                    }
+                                }
+                                tr {
+                                    td style=(format!("font-family: {EMAIL_FONT}; font-size: 20px; font-weight: 700; line-height: 1.3; color: #1a1a1a; padding: 0 0 10px;")) {
+                                        (lede)
+                                    }
+                                }
+                                @for review in reviews {
+                                    tr {
+                                        td style=(format!("font-family: {EMAIL_FONT}; padding: 14px 0; border-top: 1px solid #d4d4d4;")) {
+                                            a href=(format!("{}/files", review.pr_url))
+                                                style=(format!("font-family: {EMAIL_FONT}; font-size: 16px; font-weight: 700; color: #0000ee; text-decoration: underline;")) {
+                                                (review.pr_title)
+                                            }
+                                            div style=(format!("font-family: {EMAIL_FONT}; font-size: 14px; color: #595959; padding-top: 2px;")) {
+                                                (review.repo_name_with_owner)
+                                                " · " (review.comment_count)
+                                                @if review.comment_count == 1 { " comment" } @else { " comments" }
+                                                " · "
+                                                span style="color: #b30000; font-weight: 700;" {
+                                                    (format_age(review.last_comment_at))
+                                                }
+                                                " since last comment"
+                                            }
+                                        }
+                                    }
+                                }
+                                tr {
+                                    td style="padding: 24px 0;" {
+                                        a href="https://prn.coreyja.studio/dashboard"
+                                            style=(format!("font-family: {EMAIL_FONT}; display: inline-block; padding: 10px 20px; border: 2px solid #1a1a1a; font-size: 14px; font-weight: 700; color: #1a1a1a; text-decoration: none;")) {
+                                            "Open dashboard"
+                                        }
+                                    }
+                                }
+                                tr {
+                                    td style=(format!("font-family: {EMAIL_FONT}; font-size: 13px; line-height: 1.4; color: #8a8a8a; padding: 16px 0 0; border-top: 1px solid #d4d4d4;")) {
+                                        "You get this because a pending review crossed your "
+                                        (threshold_hours) "h threshold. Change the threshold or unsubscribe in "
+                                        a href="https://prn.coreyja.studio/settings" style="color: #8a8a8a;" { "Settings" }
+                                        "."
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-                p style="color: #888; margin-top: 24px; font-size: 0.85em;" {
-                    "You received this because you have pending GitHub reviews. "
-                    "Dismiss reviews on your "
-                    a href="https://prn.coreyja.studio/dashboard" { "dashboard" }
-                    " to stop notifications for them."
                 }
             }
         }
@@ -809,9 +882,9 @@ mod tests {
         {
             let sent = capturing.sent.lock().unwrap();
             assert_eq!(sent.len(), 1);
-            // Count the number of <li> items in the HTML
-            let li_count = sent[0].html_body.matches("<li").count();
-            assert_eq!(li_count, 20);
+            // Count the review rows in the HTML (one meta line per review)
+            let row_count = sent[0].html_body.matches("since last comment").count();
+            assert_eq!(row_count, 20);
         }
 
         // All 20 eligible rows stamped
