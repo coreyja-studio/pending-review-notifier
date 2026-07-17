@@ -1,0 +1,41 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Two rapid pushes to main race two release-please runs; the action is
+# idempotent but the duplicate run is noise. Queue, never cancel.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release PR / tag
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: rp
+
+  # Tags created with GITHUB_TOKEN do NOT trigger the tag-push Release
+  # workflow, so the binary build must chain off release-please's outputs
+  # here in the same run. The tag-push trigger on release.yml remains as a
+  # manual fallback only.
+  release:
+    name: Build release binaries
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag_name: ${{ needs.release-please.outputs.tag_name }}

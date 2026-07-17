@@ -27,7 +27,14 @@ file; auth is a Personal Access Token that never leaves your machine.
 
 ### Install
 
-Pre-built binaries for Linux and macOS (x86_64 and aarch64) are on the
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) (grabs the
+pre-built `prn-check` binary from the latest release — no compile):
+
+```console
+$ cargo binstall --git https://github.com/coreyja-studio/pending-review-notifier prn
+```
+
+Pre-built binaries for Linux and macOS (x86_64 and aarch64) are also on the
 [releases page](https://github.com/coreyja-studio/pending-review-notifier/releases/latest),
 with a `SHA256SUMS` file. Or build from source:
 
@@ -88,8 +95,18 @@ Or drive your own alerting off the exit code:
 
 ## Cutting a release
 
-Push a `v*` tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`). The release
-workflow builds `prn-check` on native runners for Linux and macOS (x86_64 and
-aarch64), then creates a GitHub Release with the four
-`prn-check-<target>.tar.gz` archives, a `SHA256SUMS` file, and auto-generated
-notes.
+Releases are automated with [release-please](https://github.com/googleapis/release-please):
+
+1. PR titles must be [conventional commits](https://www.conventionalcommits.org/)
+   (`feat: ...`, `fix: ...`, `feat!: ...` for breaking) — enforced by CI. The
+   squash-merge commit messages feed release-please.
+2. On every push to main, release-please maintains a release PR that bumps the
+   version in `Cargo.toml`/`Cargo.lock` and updates `CHANGELOG.md`.
+3. Merging the release PR tags `vX.Y.Z`, creates the GitHub Release, and (in
+   the same workflow run — tags created with `GITHUB_TOKEN` don't trigger
+   tag-push workflows) builds `prn-check` on native runners for Linux and
+   macOS (x86_64 and aarch64) and uploads the four `prn-check-<target>.tar.gz`
+   archives plus a `SHA256SUMS` file.
+
+Escape hatch: pushing a `v*` tag by hand still triggers the release workflow
+directly and builds/uploads the same assets.

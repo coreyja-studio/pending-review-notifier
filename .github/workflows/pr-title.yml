@@ -1,0 +1,38 @@
+name: PR Title
+
+# Squash-merge titles become the commit messages release-please reads to
+# compute the next version and the changelog, so every PR title must be a
+# conventional commit.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title follows conventional commits
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # Conventional commit types that release-please recognizes
+          # See: https://www.conventionalcommits.org/
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?(!)?: .+'
+
+          if [[ "$PR_TITLE" =~ $pattern ]]; then
+            echo "PR title follows conventional commits: $PR_TITLE"
+          else
+            echo "PR title does not follow conventional commits"
+            echo ""
+            echo "  Got: $PR_TITLE"
+            echo ""
+            echo "  Expected format: <type>[optional scope][!]: <description>"
+            echo ""
+            echo "  Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+            echo ""
+            echo "  Examples:"
+            echo "    feat: add user authentication"
+            echo "    fix(api): handle null response"
+            echo "    feat!: redesign settings page (breaking change)"
+            exit 1
+          fi

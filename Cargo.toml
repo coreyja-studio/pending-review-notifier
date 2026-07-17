@@ -3,13 +3,32 @@ name = "prn"
 version = "0.1.0"
 edition = "2024"
 description = "Pending Review Notifier — nags you about your own forgotten pending GitHub reviews"
+repository = "https://github.com/coreyja-studio/pending-review-notifier"
 
-# The service binary (`prn`, src/main.rs) is auto-discovered. `prn-check` is the
-# standalone CLI (docs/DESIGN.md "CLI mode"): it links src/discovery.rs directly
-# via #[path] and never touches the web/jobs/DB stack.
+# The `service` feature exists only to gate the service bin: cargo-binstall
+# skips bins whose required-features aren't met, so `cargo binstall prn`
+# installs just the prebuilt `prn-check`. Default-on keeps plain
+# `cargo build` / the Fly Dockerfile building the service unchanged.
+[features]
+default = ["service"]
+service = []
+
+# The service binary (docs/DESIGN.md): web/jobs/DB stack.
+[[bin]]
+name = "prn"
+path = "src/main.rs"
+required-features = ["service"]
+
+# `prn-check` is the standalone CLI (docs/DESIGN.md "CLI mode"): it links
+# src/discovery.rs directly via #[path] and never touches the web/jobs/DB stack.
 [[bin]]
 name = "prn-check"
 path = "src/prn_check/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/prn-check-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
 cja = { git = "https://github.com/coreyja/cja", rev = "d23caa0" }

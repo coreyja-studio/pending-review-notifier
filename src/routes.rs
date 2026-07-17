@@ -129,19 +129,19 @@ async fn landing() -> Markup {
                             }
                             pre {
                                 code {
-                                    "cargo install --git https://github.com/coreyja-studio/pending-review-notifier --bin prn-check\n"
+                                    "cargo binstall --git https://github.com/coreyja-studio/pending-review-notifier prn\n"
                                     "\n"
                                     "GITHUB_TOKEN=ghp_... prn-check --json\n"
                                     "# exit 0: nothing newly stale. exit 1: something is."
                                 }
                             }
                             p class="fine" {
+                                "That grabs the "
                                 a href="https://github.com/coreyja-studio/pending-review-notifier/releases/latest" {
-                                    "Pre-built binaries"
+                                    "pre-built binary"
                                 }
-                                " for Linux and macOS, or "
-                                code { "cargo install" }
-                                " as above."
+                                " for Linux and macOS. No binstall? Build from source: "
+                                code { "cargo install --git https://github.com/coreyja-studio/pending-review-notifier --bin prn-check" }
                             }
                         }
                     }
@@ -726,8 +726,12 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
 
-        // The CLI section: pitch, install command, exit-code hook, releases link.
+        // The CLI section: pitch, install commands (binstall primary,
+        // from-source fallback), exit-code hook, releases link.
         assert!(body.contains("Or run it yourself"));
+        assert!(body.contains(
+            "cargo binstall --git https://github.com/coreyja-studio/pending-review-notifier prn"
+        ));
         assert!(body.contains(
             "cargo install --git https://github.com/coreyja-studio/pending-review-notifier --bin prn-check"
         ));
