@@ -68,7 +68,8 @@ EXIT CODES:
 
 Reviews that are already stale the first time prn-check sees them are shown as
 backlog but never alert; only reviews it watches cross the threshold do. Once
-a review alerts, it will not alert again for 7 days.
+a review alerts, it will not alert again for 7 days — unless you comment on it
+again, which starts a new cycle.
 ";
 
 struct Args {

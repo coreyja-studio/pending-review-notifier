@@ -74,9 +74,10 @@ Backlog (2; already stale when first seen, never alerts):
 - `--quiet` — print only newly actionable reviews (nothing on a quiet run)
 
 Exit codes: `0` nothing newly actionable, `1` newly actionable reviews exist,
-`2` error. A review that alerted won't alert again for 7 days, and reviews that
-were already stale the first time `prn-check` ever saw them are backlog: shown,
-but never cause exit 1.
+`2` error. A review that alerted won't alert again for 7 days — unless you
+comment on it again, which starts a new cycle — and reviews that were already
+stale the first time `prn-check` ever saw them are backlog: shown, but never
+cause exit 1.
 
 ### Cron
 

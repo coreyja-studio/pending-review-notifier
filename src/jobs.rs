@@ -149,9 +149,12 @@ struct ReminderReviewRow {
 ///
 /// Selects rows where `is_backlog = false`, `dismissed_at IS NULL`, the staleness
 /// threshold is exceeded (strict `>`, matching `discovery::is_stale`), and the
-/// per-review dedup (`notified_at`) allows re-nagging after 7 days. That dedup
-/// is also what makes the every-tick enqueue safe: once a review is emailed,
-/// the next tick's run selects nothing and sends nothing.
+/// per-review dedup allows it: never reminded, OR a comment landed after the
+/// last reminder (`notified_at < last_comment_at` — each new comment starts a
+/// new reminder cycle), OR the last reminder is over 7 days old (the re-nudge
+/// for reviews that stay untouched-stale). That dedup is also what makes the
+/// every-tick enqueue safe: once a review is emailed, the next tick's run
+/// selects nothing and sends nothing.
 ///
 /// If rows match, sends ONE email per user per tick (batching everything that
 /// newly qualified, capped at 20 items) and stamps `notified_at` on each.
@@ -187,7 +190,9 @@ impl Job<AppState> for SendReminder {
                AND is_backlog = false
                AND dismissed_at IS NULL
                AND now() - last_comment_at > make_interval(hours => $2)
-               AND (notified_at IS NULL OR notified_at < now() - interval '7 days')
+               AND (notified_at IS NULL
+                    OR notified_at < last_comment_at
+                    OR notified_at < now() - interval '7 days')
              ORDER BY last_comment_at ASC
              LIMIT 20",
             self.user_id,
@@ -790,25 +795,27 @@ mod tests {
         );
         let user_id = insert_user_for_reminder(&db, 4).await;
 
-        // notified_at < 7 days ago → excluded
+        // Reminded 3 days ago, no comment since (last_comment_at older than
+        // notified_at) → still inside the 7-day window → excluded.
         insert_reminder_review(
             &db,
             user_id,
             "R_RECENT",
             "Recently notified",
-            Utc::now() - Duration::hours(10),
+            Utc::now() - Duration::days(10),
             false,
             None,
             Some(Utc::now() - Duration::days(3)),
         )
         .await;
-        // notified_at > 7 days ago → included
+        // Reminded 8 days ago, no comment since → past the 7-day window → the
+        // untouched-stale re-nudge fires.
         insert_reminder_review(
             &db,
             user_id,
             "R_OLD",
             "Old notification",
-            Utc::now() - Duration::hours(10),
+            Utc::now() - Duration::days(10),
             false,
             None,
             Some(Utc::now() - Duration::days(8)),
@@ -821,6 +828,98 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert!(sent[0].html_body.contains("Old notification"));
         assert!(!sent[0].html_body.contains("Recently notified"));
+    }
+
+    #[sqlx::test]
+    async fn send_reminder_new_comment_after_reminder_starts_a_new_cycle(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_reminder(&db, 3).await;
+
+        // First crossing → first reminder.
+        insert_reminder_review(
+            &db,
+            user_id,
+            "R1",
+            "Neglected twice",
+            Utc::now() - Duration::hours(4),
+            false,
+            None,
+            None,
+        )
+        .await;
+        SendReminder { user_id }.run(state.clone()).await.unwrap();
+        assert_eq!(capturing.sent.lock().unwrap().len(), 1);
+
+        // Simulate the passage of time: the reminder went out 2 days ago, the
+        // user commented again 4 hours ago (i.e. AFTER that reminder), then
+        // neglected the review past the threshold again. notified_at <
+        // last_comment_at → a new comment starts a new reminder cycle, well
+        // inside the 7-day window.
+        sqlx::query!(
+            "UPDATE pending_reviews
+             SET notified_at = now() - interval '2 days',
+                 last_comment_at = now() - interval '4 hours'
+             WHERE review_id = 'R1'"
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        SendReminder { user_id }.run(state).await.unwrap();
+
+        {
+            let sent = capturing.sent.lock().unwrap();
+            assert_eq!(
+                sent.len(),
+                2,
+                "a comment newer than the last reminder must re-arm it"
+            );
+            assert!(sent[1].html_body.contains("Neglected twice"));
+        }
+
+        // And the stamp was refreshed, closing the new cycle.
+        let notified: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT notified_at FROM pending_reviews WHERE review_id = 'R1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(notified.unwrap() > Utc::now() - Duration::minutes(1));
+    }
+
+    #[sqlx::test]
+    async fn send_reminder_re_crossing_without_a_newer_comment_stays_quiet(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_reminder(&db, 3).await;
+
+        // Control for the new-cycle rule: reminded 2 days ago, and the newest
+        // comment predates that reminder. Stale again, but no new comment and
+        // inside the 7-day window → no email.
+        insert_reminder_review(
+            &db,
+            user_id,
+            "R1",
+            "Still the same neglect",
+            Utc::now() - Duration::days(5),
+            false,
+            None,
+            Some(Utc::now() - Duration::days(2)),
+        )
+        .await;
+
+        SendReminder { user_id }.run(state).await.unwrap();
+
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 0);
     }
 
     #[sqlx::test]

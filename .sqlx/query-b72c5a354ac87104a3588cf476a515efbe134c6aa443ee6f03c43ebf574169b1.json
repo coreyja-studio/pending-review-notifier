@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, pr_title, repo_name_with_owner, pr_url, comment_count, last_comment_at\n             FROM pending_reviews\n             WHERE user_id = $1\n               AND is_backlog = false\n               AND dismissed_at IS NULL\n               AND now() - last_comment_at > make_interval(hours => $2)\n               AND (notified_at IS NULL OR notified_at < now() - interval '7 days')\n             ORDER BY last_comment_at ASC\n             LIMIT 20",
+  "query": "SELECT id, pr_title, repo_name_with_owner, pr_url, comment_count, last_comment_at\n             FROM pending_reviews\n             WHERE user_id = $1\n               AND is_backlog = false\n               AND dismissed_at IS NULL\n               AND now() - last_comment_at > make_interval(hours => $2)\n               AND (notified_at IS NULL\n                    OR notified_at < last_comment_at\n                    OR notified_at < now() - interval '7 days')\n             ORDER BY last_comment_at ASC\n             LIMIT 20",
   "describe": {
     "columns": [
       {
@@ -49,5 +49,5 @@
       false
     ]
   },
-  "hash": "47983e470ab4de21622e8006463bc30222a53dc0eaf0ea018af7c00960b8aa60"
+  "hash": "b72c5a354ac87104a3588cf476a515efbe134c6aa443ee6f03c43ebf574169b1"
 }

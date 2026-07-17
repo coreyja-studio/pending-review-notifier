@@ -113,7 +113,9 @@ mapping table if needed for dashboard auth (see cja `Session` extractor).
   comment (which also tracks their working hours for free).
 - `SendReminder { user_id }` — select rows where `is_backlog = false`, `dismissed_at is
   null`, `now() - last_comment_at > threshold_hours`, and (`notified_at is null` or
-  `notified_at < now() - 7 days`) → send one email (cap 20 items) → stamp `notified_at`.
+  `notified_at < last_comment_at` — a comment newer than the last reminder starts a new
+  cycle — or `notified_at < now() - 7 days`) → send one email (cap 20 items) → stamp
+  `notified_at`.
   No qualifying rows → no email; the `notified_at` dedup is what keeps the every-tick
   enqueue quiet after a review has been reminded once.
 - cja cron gotchas: the `cron` crate uses **7-field** expressions (sec min hour dom mon

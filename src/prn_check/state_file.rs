@@ -4,8 +4,9 @@
 //! Every classification rule delegates to [`crate::discovery`] so the CLI and
 //! the service can never drift: staleness via [`discovery::is_stale`], the
 //! anti-flood backlog rule via [`discovery::resolve_backlog`]. This module adds
-//! only persistence and the 7-day notified-at dedup — the same rules the
-//! service's `SyncUser`/`SendReminder` jobs apply against Postgres.
+//! only persistence and the notified-at dedup (new-comment reset + 7-day
+//! re-nudge) — the same rules the service's `SyncUser`/`SendReminder` jobs
+//! apply against Postgres.
 //!
 //! [`apply_sweep`] is pure (state in, state out, injected `now`), so the whole
 //! transition machine is testable without a network or filesystem.
@@ -20,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use crate::discovery::{self, DiscoveredReview};
 
 /// Per-review re-alert window, matching the service's `SendReminder` dedup
-/// (`notified_at IS NULL OR notified_at < now() - interval '7 days'`).
+/// (`notified_at IS NULL OR notified_at < last_comment_at OR notified_at <
+/// now() - interval '7 days'`). A comment newer than the last alert starts a
+/// new cycle immediately; this window only gates untouched-stale re-nudges.
 pub const NOTIFY_DEDUP_DAYS: i64 = 7;
 
 /// The on-disk state file: one entry per pending review currently visible on
@@ -86,7 +89,8 @@ pub struct SweepOutcome {
     /// and get `notified_at` stamped.
     pub newly_actionable: Vec<ReportItem>,
     /// Stale and non-backlog, but reported within the last
-    /// [`NOTIFY_DEDUP_DAYS`] days — shown, no alert.
+    /// [`NOTIFY_DEDUP_DAYS`] days with no comment newer than that report —
+    /// shown, no alert.
     pub snoozed: Vec<ReportItem>,
     /// Already stale on first sight — shown, never alerts.
     pub backlog: Vec<ReportItem>,
@@ -132,7 +136,9 @@ pub fn save(state: &StateFile, path: &Path) -> Result<()> {
 /// - staleness: strict greater-than via [`discovery::is_stale`]
 /// - backlog: [`discovery::resolve_backlog`] against the previously stored flag
 /// - dedup: reviews reported actionable in the last [`NOTIFY_DEDUP_DAYS`] days
-///   are snoozed, not re-alerted; newly-actionable ones get `notified_at = now`
+///   are snoozed, not re-alerted — unless a comment landed after that report
+///   (`notified_at < last_comment_at`), which starts a new cycle;
+///   newly-actionable ones get `notified_at = now`
 /// - reap: entries not in `discovered` are dropped (gone from GitHub forever)
 pub fn apply_sweep(
     state: &mut StateFile,
@@ -173,10 +179,12 @@ pub fn apply_sweep(
             outcome.backlog.push(item);
         } else if !stale_now {
             outcome.fresh.push(item);
-        } else if entry
-            .notified_at
-            .is_none_or(|at| at < now - Duration::days(NOTIFY_DEDUP_DAYS))
-        {
+        } else if entry.notified_at.is_none_or(|at| {
+            // Same three-way disjunction as the service: never alerted, a
+            // comment landed after the last alert (new cycle), or the last
+            // alert is past the re-nudge window.
+            at < entry.last_comment_at || at < now - Duration::days(NOTIFY_DEDUP_DAYS)
+        }) {
             entry.notified_at = Some(now);
             outcome.newly_actionable.push(item);
         } else {
@@ -333,6 +341,43 @@ mod tests {
         let outcome = apply_sweep(&mut state, &[review("R1", last_comment_at)], 4, re_alert);
         assert_eq!(ids(&outcome.newly_actionable), vec!["R1"]);
         assert_eq!(state.reviews["R1"].notified_at, Some(re_alert));
+    }
+
+    #[test]
+    fn new_comment_after_alert_starts_a_new_cycle() {
+        let mut state = StateFile::default();
+        let first_comment = ts("2026-07-01T00:00:00Z");
+
+        // Watched fresh, then crossed the threshold → alerted once.
+        apply_sweep(
+            &mut state,
+            &[review("R1", first_comment)],
+            4,
+            ts("2026-07-01T01:00:00Z"),
+        );
+        let first_alert = ts("2026-07-01T08:00:00Z");
+        let outcome = apply_sweep(&mut state, &[review("R1", first_comment)], 4, first_alert);
+        assert_eq!(ids(&outcome.newly_actionable), vec!["R1"]);
+
+        // Two days later the user adds a new comment — newer than the alert,
+        // review seen fresh again → just watched.
+        let new_comment = ts("2026-07-03T10:00:00Z");
+        let outcome = apply_sweep(
+            &mut state,
+            &[review("R1", new_comment)],
+            4,
+            ts("2026-07-03T11:00:00Z"),
+        );
+        assert_eq!(ids(&outcome.fresh), vec!["R1"]);
+
+        // ...then neglects it past the threshold again. Still well inside the
+        // 7-day window, but the comment postdates the last alert → new cycle,
+        // alert fires. (The control — re-crossing with NO newer comment stays
+        // snoozed inside 7 days — is `notified_reviews_are_snoozed_for_seven_days`.)
+        let second_alert = ts("2026-07-03T20:00:00Z");
+        let outcome = apply_sweep(&mut state, &[review("R1", new_comment)], 4, second_alert);
+        assert_eq!(ids(&outcome.newly_actionable), vec!["R1"]);
+        assert_eq!(state.reviews["R1"].notified_at, Some(second_alert));
     }
 
     #[test]
