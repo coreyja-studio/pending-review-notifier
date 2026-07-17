@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT reminders_paused FROM users",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reminders_paused",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d7c4299023210fdb1bc3882b894a57c7af17a7f6db3f30362302405684e7471d"
+}

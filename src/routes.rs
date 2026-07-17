@@ -43,6 +43,10 @@ pub fn routes() -> Router<AppState> {
         .route("/dashboard", get(dashboard))
         .route("/dismiss/{id}", post(dismiss))
         .route("/settings", get(settings).post(update_settings))
+        .route(
+            "/unsubscribe/{token}",
+            get(unsubscribe_confirm).post(unsubscribe_pause),
+        )
 }
 
 /// Log the error and return an opaque 500. Never include token material in
@@ -192,6 +196,14 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
     .await
     .map_err(internal_error)?;
 
+    let reminders_paused = sqlx::query_scalar!(
+        "SELECT reminders_paused FROM users WHERE user_id = $1",
+        user.user_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(internal_error)?;
+
     // Partition into email-eligible (is_backlog = false) and backlog (is_backlog = true).
     let email_eligible: Vec<_> = reviews.iter().filter(|r| !r.is_backlog).collect();
     let backlog: Vec<_> = reviews.iter().filter(|r| r.is_backlog).collect();
@@ -204,6 +216,14 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
                 div class="wrap" {
                     (masthead(&user, false))
                     main {
+                        @if reminders_paused {
+                            // The dashboard must not imply emails are flowing.
+                            p class="notice" {
+                                "Reminders paused. Resume in "
+                                a href="/settings" { "Settings" }
+                                "."
+                            }
+                        }
                         @if email_eligible.is_empty() && backlog.is_empty() {
                             p class="empty" { "No pending reviews anywhere. Close the tab." }
                         } @else {
@@ -320,16 +340,21 @@ async fn dismiss(
     Ok(Redirect::to("/dashboard"))
 }
 
+/// The reminders toggle is a `<select>` (values `on` / `paused`), not a
+/// checkbox: an unchecked checkbox is simply absent from the form body, which
+/// with `Form<T>` turns "off" into a missing-field problem. A select always
+/// submits exactly one value.
 #[derive(Deserialize)]
 struct SettingsForm {
     csrf: Option<String>,
     threshold_hours: i32,
+    reminders: String,
 }
 
 /// `GET /settings` — render a settings form pre-filled with the user's current values.
 async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, Response> {
     let user_row = sqlx::query!(
-        "SELECT threshold_hours FROM users WHERE user_id = $1",
+        "SELECT threshold_hours, reminders_paused FROM users WHERE user_id = $1",
         user.user_id
     )
     .fetch_one(&state.db)
@@ -358,6 +383,7 @@ async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Ma
     Ok(settings_page(
         &user,
         &user_row.threshold_hours,
+        user_row.reminders_paused,
         &installations,
         None,
     ))
@@ -367,6 +393,7 @@ async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Ma
 fn settings_page(
     user: &CurrentUser,
     threshold_hours: &i32,
+    reminders_paused: bool,
     installations: &[SettingsInstallation],
     error: Option<&str>,
 ) -> Markup {
@@ -391,6 +418,14 @@ fn settings_page(
                                 input id="threshold_hours" type="number" name="threshold_hours"
                                     min="1" value=(threshold_hours);
                                 p class="hint" { "Hours after your last comment before the reminder email goes out." }
+                            }
+                            div class="field" {
+                                label for="reminders" { "Reminders" }
+                                select id="reminders" name="reminders" {
+                                    option value="on" selected[!reminders_paused] { "on" }
+                                    option value="paused" selected[reminders_paused] { "paused" }
+                                }
+                                p class="hint" { "Paused stops reminder emails. The dashboard keeps updating." }
                             }
                             button type="submit" class="btn btn-primary" { "Save" }
                         }
@@ -470,10 +505,26 @@ async fn update_settings(
         })
         .collect();
 
+    let reminders_paused = match form.reminders.as_str() {
+        "on" => false,
+        "paused" => true,
+        _ => {
+            return Ok(settings_page(
+                &user,
+                &form.threshold_hours,
+                false,
+                &installations,
+                Some("Reminders must be on or paused."),
+            )
+            .into_response());
+        }
+    };
+
     if form.threshold_hours < 1 {
         return Ok(settings_page(
             &user,
             &form.threshold_hours,
+            reminders_paused,
             &installations,
             Some("Threshold must be at least 1 hour."),
         )
@@ -481,8 +532,9 @@ async fn update_settings(
     }
 
     sqlx::query!(
-        "UPDATE users SET threshold_hours = $1 WHERE user_id = $2",
+        "UPDATE users SET threshold_hours = $1, reminders_paused = $2 WHERE user_id = $3",
         form.threshold_hours,
+        reminders_paused,
         user.user_id
     )
     .execute(&state.db)
@@ -490,6 +542,121 @@ async fn update_settings(
     .map_err(internal_error)?;
 
     Ok(Redirect::to("/settings").into_response())
+}
+
+/// Minimal signed-out page shell for the unsubscribe flow (no masthead, no
+/// session).
+fn unsubscribe_shell(title: &str, body: Markup) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            (page_head(title))
+            body {
+                div class="wrap" {
+                    main { (body) }
+                }
+            }
+        }
+    }
+}
+
+/// Plain 404 for an unknown or malformed unsubscribe token. Deliberately says
+/// nothing about which tokens exist.
+fn unsubscribe_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        unsubscribe_shell(
+            "Not found — Pending Review Notifier",
+            html! {
+                h1 { "Not found" }
+                p { "This unsubscribe link is not valid." }
+            },
+        ),
+    )
+        .into_response()
+}
+
+/// Look up the user owning an unsubscribe token. `Ok(None)` covers both a
+/// malformed token (not a UUID) and a UUID that matches no user.
+async fn user_for_unsubscribe_token(
+    state: &AppState,
+    token: &str,
+) -> Result<Option<Uuid>, Response> {
+    let Ok(token) = token.parse::<Uuid>() else {
+        return Ok(None);
+    };
+    sqlx::query_scalar!(
+        "SELECT user_id FROM users WHERE unsubscribe_token = $1",
+        token
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal_error)
+}
+
+/// `GET /unsubscribe/{token}` — confirm page, one button, no login.
+///
+/// Must NOT mutate anything: mail clients and link-prefetching proxies follow
+/// GETs, and a prefetch must never unsubscribe anyone. The pause happens on
+/// the POST the form (or an RFC 8058 one-click provider) sends.
+async fn unsubscribe_confirm(
+    State(state): State<AppState>,
+    AxumPath(token): AxumPath<String>,
+) -> Result<Markup, Response> {
+    if user_for_unsubscribe_token(&state, &token).await?.is_none() {
+        return Err(unsubscribe_not_found());
+    }
+
+    Ok(unsubscribe_shell(
+        "Pause reminders — Pending Review Notifier",
+        html! {
+            h1 { "Pause reminders" }
+            p {
+                "This stops reminder emails for your account. Your dashboard \
+                keeps updating, and you can resume from Settings any time."
+            }
+            form method="post" action=(format!("/unsubscribe/{token}")) {
+                button type="submit" class="btn btn-primary" { "Pause reminders" }
+            }
+        },
+    ))
+}
+
+/// `POST /unsubscribe/{token}` — pause reminders. Idempotent.
+///
+/// Deliberately NO session and NO CSRF token: the unguessable per-user UUID
+/// in the path is the whole authentication (a capability URL). That is what
+/// lets mail providers' RFC 8058 one-click POSTs — a cookie-less form body of
+/// `List-Unsubscribe=One-Click` — work. The body is ignored entirely: any
+/// POST to a valid token pauses, whatever the payload. CSRF is a non-issue
+/// because a forger would already need the secret token, and the only effect
+/// is the safe one (stop sending email).
+async fn unsubscribe_pause(
+    State(state): State<AppState>,
+    AxumPath(token): AxumPath<String>,
+) -> Result<Markup, Response> {
+    let Some(user_id) = user_for_unsubscribe_token(&state, &token).await? else {
+        return Err(unsubscribe_not_found());
+    };
+
+    sqlx::query!(
+        "UPDATE users SET reminders_paused = true WHERE user_id = $1",
+        user_id
+    )
+    .execute(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(unsubscribe_shell(
+        "Reminders paused — Pending Review Notifier",
+        html! {
+            h1 { "Reminders paused." }
+            p {
+                a href="/login" { "Sign in" }
+                " to resume."
+            }
+        },
+    ))
 }
 
 /// `POST /logout` — detach the user from the session (the anonymous session
@@ -1259,7 +1426,7 @@ mod tests {
             .oneshot(post_form(
                 "/settings",
                 &session_cookies,
-                format!("csrf={csrf}&threshold_hours=8"),
+                format!("csrf={csrf}&threshold_hours=8&reminders=on"),
             ))
             .await
             .unwrap();
@@ -1289,7 +1456,7 @@ mod tests {
             .oneshot(post_form(
                 "/settings",
                 &session_cookies,
-                format!("csrf={csrf}&threshold_hours=0"),
+                format!("csrf={csrf}&threshold_hours=0&reminders=on"),
             ))
             .await
             .unwrap();
@@ -1324,7 +1491,7 @@ mod tests {
             .oneshot(post_form(
                 "/settings",
                 &session_cookies,
-                "threshold_hours=8".to_string(),
+                "threshold_hours=8&reminders=on".to_string(),
             ))
             .await
             .unwrap();
@@ -1336,5 +1503,301 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(user.threshold_hours, 3);
+    }
+
+    #[sqlx::test]
+    async fn settings_pause_toggle_round_trips_with_csrf(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let csrf = csrf_hex(&db).await;
+
+        // Default state: the select shows "on" selected.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/settings")
+                    .header(header::COOKIE, &session_cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("name=\"reminders\""));
+        assert!(body.contains("<option value=\"on\" selected>"));
+        assert!(!body.contains("<option value=\"paused\" selected>"));
+
+        // Pause via the settings form (with CSRF).
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/settings",
+                &session_cookies,
+                format!("csrf={csrf}&threshold_hours=3&reminders=paused"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let paused: bool = sqlx::query_scalar!("SELECT reminders_paused FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert!(paused);
+
+        // The page now reflects the paused state.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/settings")
+                    .header(header::COOKIE, &session_cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<option value=\"paused\" selected>"));
+
+        // And back on.
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/settings",
+                &session_cookies,
+                format!("csrf={csrf}&threshold_hours=3&reminders=on"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let paused: bool = sqlx::query_scalar!("SELECT reminders_paused FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert!(!paused);
+    }
+
+    #[sqlx::test]
+    async fn settings_pause_requires_csrf(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/settings",
+                &session_cookies,
+                "threshold_hours=3&reminders=paused".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let paused: bool = sqlx::query_scalar!("SELECT reminders_paused FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert!(!paused, "no CSRF, no pause");
+    }
+
+    #[sqlx::test]
+    async fn dashboard_shows_paused_notice(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+
+        let get_dashboard = || async {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/dashboard")
+                        .header(header::COOKIE, &session_cookies)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+
+        assert!(!get_dashboard().await.contains("Reminders paused"));
+
+        sqlx::query!("UPDATE users SET reminders_paused = true")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let body = get_dashboard().await;
+        assert!(body.contains("Reminders paused. Resume in"));
+        assert!(body.contains("/settings"));
+    }
+
+    // --- Unsubscribe tests ---
+
+    async fn signed_out_state_with_user(db: &PgPool) -> (AppState, Uuid, Uuid) {
+        let state = test_state(db.clone(), test_config());
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO users (
+                user_id, github_login, github_user_id, access_token_enc,
+                refresh_token_enc, token_expires_at, email
+            )
+            VALUES ($1, 'coreyja', 12345, $2, $3, $4, 'corey@example.com')",
+            user_id,
+            state.crypto.encrypt("tok", user_id.as_bytes()).unwrap(),
+            state.crypto.encrypt("ref", user_id.as_bytes()).unwrap(),
+            Utc::now() + Duration::days(30),
+        )
+        .execute(db)
+        .await
+        .unwrap();
+        let token: Uuid = sqlx::query_scalar!(
+            "SELECT unsubscribe_token FROM users WHERE user_id = $1",
+            user_id
+        )
+        .fetch_one(db)
+        .await
+        .unwrap();
+        (state, user_id, token)
+    }
+
+    async fn paused(db: &PgPool, user_id: Uuid) -> bool {
+        sqlx::query_scalar!(
+            "SELECT reminders_paused FROM users WHERE user_id = $1",
+            user_id
+        )
+        .fetch_one(db)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn unsubscribe_get_shows_confirm_and_does_not_pause(db: PgPool) {
+        let (state, user_id, token) = signed_out_state_with_user(&db).await;
+        let app = test_app(&state);
+
+        // No cookies, no session — the token is the whole credential.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/unsubscribe/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Pause reminders"));
+        assert!(body.contains(&format!("action=\"/unsubscribe/{token}\"")));
+
+        // GET must not mutate — a link prefetcher must not unsubscribe anyone.
+        assert!(!paused(&db, user_id).await, "GET must not pause");
+    }
+
+    #[sqlx::test]
+    async fn unsubscribe_post_pauses(db: PgPool) {
+        let (state, user_id, token) = signed_out_state_with_user(&db).await;
+        let app = test_app(&state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/unsubscribe/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Reminders paused."));
+        assert!(body.contains("Sign in"));
+
+        assert!(paused(&db, user_id).await);
+    }
+
+    #[sqlx::test]
+    async fn unsubscribe_post_accepts_one_click_form_body(db: PgPool) {
+        let (state, user_id, token) = signed_out_state_with_user(&db).await;
+        let app = test_app(&state);
+
+        // RFC 8058: mail providers POST `List-Unsubscribe=One-Click` with no
+        // cookies. Must succeed without CSRF.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/unsubscribe/{token}"))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("List-Unsubscribe=One-Click"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(paused(&db, user_id).await);
+    }
+
+    #[sqlx::test]
+    async fn unsubscribe_unknown_or_malformed_token_is_404(db: PgPool) {
+        let (state, user_id, _token) = signed_out_state_with_user(&db).await;
+        let app = test_app(&state);
+
+        // Well-formed UUID that matches no user.
+        let bogus = Uuid::new_v4();
+        for request in [
+            Request::get(format!("/unsubscribe/{bogus}"))
+                .body(Body::empty())
+                .unwrap(),
+            Request::post(format!("/unsubscribe/{bogus}"))
+                .body(Body::empty())
+                .unwrap(),
+            // Not even a UUID.
+            Request::get("/unsubscribe/not-a-token")
+                .body(Body::empty())
+                .unwrap(),
+            Request::post("/unsubscribe/not-a-token")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        assert!(!paused(&db, user_id).await);
     }
 }

@@ -173,7 +173,8 @@ impl Job<AppState> for SendReminder {
 
     async fn run(&self, state: AppState) -> cja::Result<()> {
         let Some(user) = sqlx::query!(
-            "SELECT threshold_hours, email FROM users WHERE user_id = $1 AND status = 'active'",
+            "SELECT threshold_hours, email, reminders_paused, unsubscribe_token
+             FROM users WHERE user_id = $1 AND status = 'active'",
             self.user_id
         )
         .fetch_optional(&state.db)
@@ -181,6 +182,13 @@ impl Job<AppState> for SendReminder {
         else {
             return Ok(());
         };
+
+        // Paused users: the sweep may keep enqueuing, but eligibility lives
+        // here with the rest of the rules, so the job no-ops. Sync continues
+        // untouched — the dashboard stays current while emails stop.
+        if user.reminders_paused {
+            return Ok(());
+        }
 
         let reviews = sqlx::query_as!(
             ReminderReviewRow,
@@ -212,8 +220,25 @@ impl Job<AppState> for SendReminder {
             format!("{} pending reviews need a nudge", reviews.len())
         };
 
-        let html_body = render_reminder_email(&reviews, user.threshold_hours);
-        state.mailer.send(&user.email, &subject, &html_body).await?;
+        // The per-user unsubscribe capability URL: both the List-Unsubscribe
+        // header value and the footer link point here. MailPace only supports
+        // the List-Unsubscribe header (no List-Unsubscribe-Post), so the
+        // one-click POST is advertised by the URL itself, not the companion
+        // header.
+        let unsubscribe_url = format!(
+            "{}/unsubscribe/{}",
+            state.config.base_url, user.unsubscribe_token
+        );
+        let html_body = render_reminder_email(&reviews, user.threshold_hours, &unsubscribe_url);
+        state
+            .mailer
+            .send(
+                &user.email,
+                &subject,
+                &html_body,
+                Some(&format!("<{unsubscribe_url}>")),
+            )
+            .await?;
 
         let ids: Vec<Uuid> = reviews.iter().map(|r| r.id).collect();
         sqlx::query!(
@@ -258,7 +283,11 @@ const EMAIL_FONT: &str =
 /// Dark-mode tolerance: explicit `color-scheme` metas, no `background-color`
 /// anywhere (the client supplies it), no pure #000/#fff, and a bordered — not
 /// filled — CTA so forced inversion can't produce black-on-black.
-fn render_reminder_email(reviews: &[ReminderReviewRow], threshold_hours: i32) -> String {
+fn render_reminder_email(
+    reviews: &[ReminderReviewRow],
+    threshold_hours: i32,
+    unsubscribe_url: &str,
+) -> String {
     let lede = if reviews.len() == 1 {
         "You left a pending review hanging.".to_string()
     } else {
@@ -341,6 +370,8 @@ fn render_reminder_email(reviews: &[ReminderReviewRow], threshold_hours: i32) ->
                                         "You get this because a pending review sat untouched for more than "
                                         (threshold_hours) " hours after your last comment. Change the threshold or unsubscribe in "
                                         a href="https://prn.coreyja.studio/settings" style="color: #8a8a8a;" { "Settings" }
+                                        ", or "
+                                        a href=(unsubscribe_url) style="color: #8a8a8a;" { "pause reminders" }
                                         "."
                                     }
                                 }
@@ -1085,5 +1116,101 @@ mod tests {
 
         let sent = capturing.sent.lock().unwrap();
         assert_eq!(sent.len(), 0);
+    }
+
+    #[sqlx::test]
+    async fn send_reminder_skips_paused_user_and_unpause_resumes(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_reminder(&db, 4).await;
+        sqlx::query!(
+            "UPDATE users SET reminders_paused = true WHERE user_id = $1",
+            user_id
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Eligible review exists — the pause alone must keep the tick quiet.
+        insert_reminder_review(
+            &db,
+            user_id,
+            "R1",
+            "Stale while paused",
+            Utc::now() - Duration::hours(10),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        SendReminder { user_id }.run(state.clone()).await.unwrap();
+        assert_eq!(capturing.sent.lock().unwrap().len(), 0, "paused → no email");
+
+        // Unpause → the same review is emailed on the next tick.
+        sqlx::query!(
+            "UPDATE users SET reminders_paused = false WHERE user_id = $1",
+            user_id
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        SendReminder { user_id }.run(state).await.unwrap();
+
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "unpause resumes reminders");
+        assert!(sent[0].html_body.contains("Stale while paused"));
+    }
+
+    #[sqlx::test]
+    async fn send_reminder_carries_unsubscribe_header_and_footer_link(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_reminder(&db, 4).await;
+        let token: Uuid = sqlx::query_scalar!(
+            "SELECT unsubscribe_token FROM users WHERE user_id = $1",
+            user_id
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        insert_reminder_review(
+            &db,
+            user_id,
+            "R1",
+            "Stale PR",
+            Utc::now() - Duration::hours(5),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        SendReminder { user_id }.run(state).await.unwrap();
+
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        // test_config().base_url is https://prn.test
+        let unsubscribe_url = format!("https://prn.test/unsubscribe/{token}");
+        assert_eq!(
+            sent[0].list_unsubscribe.as_deref(),
+            Some(format!("<{unsubscribe_url}>").as_str()),
+            "List-Unsubscribe header value with RFC 2369 angle brackets"
+        );
+        assert!(
+            sent[0].html_body.contains(&unsubscribe_url),
+            "footer links to the unsubscribe URL"
+        );
+        assert!(sent[0].html_body.contains("pause reminders"));
     }
 }

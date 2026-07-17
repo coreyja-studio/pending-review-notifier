@@ -57,6 +57,16 @@
         "ordinal": 10,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "reminders_paused",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "unsubscribe_token",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -73,6 +83,8 @@
       false,
       false,
       true,
+      false,
+      false,
       false
     ]
   },
