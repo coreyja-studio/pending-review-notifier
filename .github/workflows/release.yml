@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_INCREMENTAL: 0
+
+# A duplicate push of the same tag must queue behind the first run, never
+# cancel it — a cancelled build matrix leaves a release with missing assets.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners only — no cross-compilation toolchains to babysit.
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    env:
+      # prn-check never touches the database; SQLX_OFFLINE keeps the sqlx
+      # macros (which only expand in service-bin code) from wanting a
+      # DATABASE_URL at build time.
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Swatinem/rust-cache below handles caching
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build prn-check
+        run: cargo build --release --locked --bin prn-check
+
+      - name: Package
+        run: tar -czf "prn-check-${{ matrix.target }}.tar.gz" -C target/release prn-check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prn-check-${{ matrix.target }}
+          path: prn-check-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: cd dist && sha256sum prn-check-*.tar.gz > SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Re-run safe: if the release already exists (earlier run made it past
+        # this step, or a partial retry), replace its assets instead of failing.
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              dist/prn-check-*.tar.gz dist/SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              dist/prn-check-*.tar.gz dist/SHA256SUMS
+          fi

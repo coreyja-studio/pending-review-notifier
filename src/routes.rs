@@ -117,6 +117,33 @@ async fn landing() -> Markup {
                             a class="btn" id="login-link" href="/login" { "Sign in" }
                         }
                         p class="fine" { "Free. At most one email a day. Nothing stored you can't delete." }
+
+                        section class="group cli" {
+                            header class="group-header" {
+                                span { "Or run it yourself" }
+                            }
+                            p {
+                                "Don't want to trust us? " code { "prn-check" } " runs the same \
+                                staleness rules locally — your token, your cron, state in a JSON \
+                                file on your machine. Nothing leaves it."
+                            }
+                            pre {
+                                code {
+                                    "cargo install --git https://github.com/coreyja-studio/pending-review-notifier --bin prn-check\n"
+                                    "\n"
+                                    "GITHUB_TOKEN=ghp_... prn-check --json\n"
+                                    "# exit 0: nothing newly stale. exit 1: something is."
+                                }
+                            }
+                            p class="fine" {
+                                a href="https://github.com/coreyja-studio/pending-review-notifier/releases/latest" {
+                                    "Pre-built binaries"
+                                }
+                                " for Linux and macOS, or "
+                                code { "cargo install" }
+                                " as above."
+                            }
+                        }
                     }
                     (page_footer())
                 }
@@ -682,6 +709,36 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("login-link"));
         assert!(body.contains("Intl.DateTimeFormat().resolvedOptions().timeZone"));
+    }
+
+    #[tokio::test]
+    async fn landing_advertises_prn_check() {
+        let app = test_app(&lazy_test_state());
+
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        // The CLI section: pitch, install command, exit-code hook, releases link.
+        assert!(body.contains("Or run it yourself"));
+        assert!(body.contains(
+            "cargo install --git https://github.com/coreyja-studio/pending-review-notifier --bin prn-check"
+        ));
+        assert!(body.contains("prn-check --json"));
+        assert!(
+            body.contains(
+                "https://github.com/coreyja-studio/pending-review-notifier/releases/latest"
+            )
+        );
+        // The inlined stylesheet keeps the code block from overflowing on mobile.
+        assert!(body.contains("overflow-x: auto"));
     }
 
     // --- Helpers for authed route tests ---
