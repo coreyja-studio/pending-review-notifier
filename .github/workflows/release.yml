@@ -29,7 +29,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - runner: macos-latest
             target: aarch64-apple-darwin
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
     env:
       # prn-check never touches the database; SQLX_OFFLINE keeps the sqlx
@@ -79,8 +79,15 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+        # Re-run safe: if the release already exists (earlier run made it past
+        # this step, or a partial retry), replace its assets instead of failing.
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            dist/prn-check-*.tar.gz dist/SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              dist/prn-check-*.tar.gz dist/SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              dist/prn-check-*.tar.gz dist/SHA256SUMS
+          fi
