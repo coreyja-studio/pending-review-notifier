@@ -32,7 +32,10 @@ fn main() -> cja::Result<()> {
 }
 
 async fn async_main() -> cja::Result<()> {
-    setup_tracing("prn")?;
+    // Keep the eyes shutdown handle alive for the life of the process:
+    // dropping it stops eyes-subscriber's transport loop, which would
+    // silently disable eyes telemetry (enabled via EYES_ORG_ID/EYES_APP_ID).
+    let _eyes_shutdown_handle = setup_tracing("prn")?;
 
     let app_state = AppState::from_env().await?;
 
