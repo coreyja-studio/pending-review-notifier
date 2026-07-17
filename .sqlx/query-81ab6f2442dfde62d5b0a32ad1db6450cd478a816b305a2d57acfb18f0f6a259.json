@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pending_reviews SET dismissed_at = now() WHERE review_id = 'R2'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "81ab6f2442dfde62d5b0a32ad1db6450cd478a816b305a2d57acfb18f0f6a259"
+}

@@ -1,6 +1,6 @@
 use axum::{
     Form, Router,
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::StatusCode,
     response::{IntoResponse as _, Redirect, Response},
     routing::{get, post},
@@ -14,6 +14,7 @@ use cja::{
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::{
     github,
@@ -40,6 +41,8 @@ pub fn routes() -> Router<AppState> {
         .route("/logout", post(logout))
         .route("/disconnect", post(disconnect))
         .route("/dashboard", get(dashboard))
+        .route("/dismiss/{id}", post(dismiss))
+        .route("/settings", get(settings).post(update_settings))
 }
 
 /// Log the error and return an opaque 500. Never include token material in
@@ -96,6 +99,20 @@ async fn landing() -> Markup {
     }
 }
 
+/// Human-readable age from `last_comment_at` to now (e.g. "3d", "2w", "5h", "12m").
+fn format_age(last_comment_at: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed = chrono::Utc::now() - last_comment_at;
+    if elapsed.num_days() >= 7 {
+        format!("{}w", elapsed.num_days() / 7)
+    } else if elapsed.num_days() > 0 {
+        format!("{}d", elapsed.num_days())
+    } else if elapsed.num_hours() > 0 {
+        format!("{}h", elapsed.num_hours())
+    } else {
+        format!("{}m", elapsed.num_minutes().max(0))
+    }
+}
+
 async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, Response> {
     let installations = sqlx::query!(
         "SELECT i.account_login, i.repository_selection
@@ -109,6 +126,21 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
     .await
     .map_err(internal_error)?;
 
+    let reviews = sqlx::query!(
+        "SELECT id, pr_title, repo_name_with_owner, pr_url, comment_count, last_comment_at, is_backlog
+         FROM pending_reviews
+         WHERE user_id = $1 AND dismissed_at IS NULL
+         ORDER BY last_comment_at DESC",
+        user.user_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    // Partition into email-eligible (is_backlog = false) and backlog (is_backlog = true).
+    let email_eligible: Vec<_> = reviews.iter().filter(|r| !r.is_backlog).collect();
+    let backlog: Vec<_> = reviews.iter().filter(|r| r.is_backlog).collect();
+
     Ok(html! {
         (DOCTYPE)
         html lang="en" {
@@ -119,7 +151,51 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
             }
             body {
                 h1 { "Dashboard" }
-                p { "Signed in as " strong { (user.github_login) } "." }
+                p { "Signed in as " strong { (user.github_login) } ". "
+                    a href="/settings" { "Settings" }
+                }
+
+                h2 { "Pending reviews" }
+                @if email_eligible.is_empty() {
+                    p { "No pending reviews eligible for digest — you're all caught up." }
+                } @else {
+                    ul {
+                        @for review in &email_eligible {
+                            li {
+                                a href=(format!("{}/files", review.pr_url)) { (review.pr_title) }
+                                " — " (review.repo_name_with_owner)
+                                " (" (review.comment_count) " comments, "
+                                (format_age(review.last_comment_at)) " old)"
+                                form method="post" action=(format!("/dismiss/{}", review.id))
+                                    style="display:inline" {
+                                    input type="hidden" name="csrf" value=(user.csrf_hex());
+                                    button type="submit" { "Dismiss" }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                h2 { "Backlog" }
+                @if backlog.is_empty() {
+                    p { "No backlog items." }
+                } @else {
+                    ul style="opacity:0.6" {
+                        @for review in &backlog {
+                            li {
+                                a href=(format!("{}/files", review.pr_url)) { (review.pr_title) }
+                                " — " (review.repo_name_with_owner)
+                                " (" (review.comment_count) " comments, "
+                                (format_age(review.last_comment_at)) " old)"
+                                form method="post" action=(format!("/dismiss/{}", review.id))
+                                    style="display:inline" {
+                                    input type="hidden" name="csrf" value=(user.csrf_hex());
+                                    button type="submit" { "Dismiss" }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 h2 { "Covered installations" }
                 @if installations.is_empty() {
@@ -148,6 +224,235 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
             }
         }
     })
+}
+
+/// `POST /dismiss/{id}` — set `dismissed_at = now()` on a pending review row.
+/// Scoped to the current user; idempotent (`AND dismissed_at IS NULL`).
+async fn dismiss(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    AxumPath(review_id): AxumPath<Uuid>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Redirect, Response> {
+    if !csrf_matches(&user.csrf_token, form.csrf.as_deref().unwrap_or_default()) {
+        return Err(csrf_rejection());
+    }
+    sqlx::query!(
+        "UPDATE pending_reviews SET dismissed_at = now()
+         WHERE id = $1 AND user_id = $2 AND dismissed_at IS NULL",
+        review_id,
+        user.user_id
+    )
+    .execute(&state.db)
+    .await
+    .map_err(internal_error)?;
+    Ok(Redirect::to("/dashboard"))
+}
+
+#[derive(Deserialize)]
+struct SettingsForm {
+    csrf: Option<String>,
+    threshold_hours: i32,
+    digest_hour: i32,
+    timezone: String,
+}
+
+/// `GET /settings` — render a settings form pre-filled with the user's current values.
+async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, Response> {
+    let user_row = sqlx::query!(
+        "SELECT threshold_hours, digest_hour, timezone FROM users WHERE user_id = $1",
+        user.user_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    let installations = sqlx::query!(
+        "SELECT i.account_login, i.repository_selection
+         FROM installations i
+         JOIN user_installations ui ON ui.installation_id = i.installation_id
+         WHERE ui.user_id = $1
+         ORDER BY i.account_login",
+        user.user_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal_error)?;
+    let installations: Vec<SettingsInstallation> = installations
+        .into_iter()
+        .map(|i| SettingsInstallation {
+            account_login: i.account_login,
+            repository_selection: i.repository_selection,
+        })
+        .collect();
+
+    Ok(settings_page(
+        &user,
+        &user_row.threshold_hours,
+        &user_row.digest_hour,
+        &user_row.timezone,
+        &installations,
+        None,
+    ))
+}
+
+/// Reusable settings page renderer. `error` is an optional inline error message.
+fn settings_page(
+    user: &CurrentUser,
+    threshold_hours: &i32,
+    digest_hour: &i32,
+    timezone: &str,
+    installations: &[SettingsInstallation],
+    error: Option<&str>,
+) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Settings — Pending Review Notifier" }
+            }
+            body {
+                h1 { "Settings" }
+                p { "Signed in as " strong { (user.github_login) } ". "
+                    a href="/dashboard" { "Back to dashboard" }
+                }
+
+                @if let Some(err) = error {
+                    p style="color:red" { (err) }
+                }
+
+                form method="post" action="/settings" {
+                    input type="hidden" name="csrf" value=(user.csrf_hex());
+                    p {
+                        label { "Threshold (hours): "
+                            input type="number" name="threshold_hours" min="1"
+                                value=(threshold_hours);
+                        }
+                    }
+                    p {
+                        label { "Digest hour (0-23): "
+                            input type="number" name="digest_hour" min="0" max="23"
+                                value=(digest_hour);
+                        }
+                    }
+                    p {
+                        label { "Timezone (IANA): "
+                            input type="text" name="timezone" value=(timezone);
+                        }
+                    }
+                    button type="submit" { "Save" }
+                }
+
+                h2 { "Covered installations" }
+                @if installations.is_empty() {
+                    p { "No installations yet." }
+                } @else {
+                    ul {
+                        @for installation in installations {
+                            li {
+                                (installation.account_login)
+                                " (" (installation.repository_selection) " repositories)"
+                            }
+                        }
+                    }
+                }
+
+                form method="post" action="/disconnect"
+                    onsubmit="return confirm('Disconnect from GitHub and delete all your data? This cannot be undone.')" {
+                    input type="hidden" name="csrf" value=(user.csrf_hex());
+                    button type="submit" { "Disconnect" }
+                }
+            }
+        }
+    }
+}
+
+/// Row type for the installations query in settings.
+struct SettingsInstallation {
+    account_login: String,
+    repository_selection: String,
+}
+
+/// `POST /settings` — validate and update the user's settings.
+async fn update_settings(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Form(form): Form<SettingsForm>,
+) -> Result<Response, Response> {
+    if !csrf_matches(&user.csrf_token, form.csrf.as_deref().unwrap_or_default()) {
+        return Err(csrf_rejection());
+    }
+
+    let installations = sqlx::query!(
+        "SELECT i.account_login, i.repository_selection
+         FROM installations i
+         JOIN user_installations ui ON ui.installation_id = i.installation_id
+         WHERE ui.user_id = $1
+         ORDER BY i.account_login",
+        user.user_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    let installations: Vec<SettingsInstallation> = installations
+        .into_iter()
+        .map(|i| SettingsInstallation {
+            account_login: i.account_login,
+            repository_selection: i.repository_selection,
+        })
+        .collect();
+
+    if form.threshold_hours < 1 {
+        return Ok(settings_page(
+            &user,
+            &form.threshold_hours,
+            &form.digest_hour,
+            &form.timezone,
+            &installations,
+            Some("Threshold must be at least 1 hour."),
+        )
+        .into_response());
+    }
+
+    if !(0..=23).contains(&form.digest_hour) {
+        return Ok(settings_page(
+            &user,
+            &form.threshold_hours,
+            &form.digest_hour,
+            &form.timezone,
+            &installations,
+            Some("Digest hour must be between 0 and 23."),
+        )
+        .into_response());
+    }
+
+    if form.timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Ok(settings_page(
+            &user,
+            &form.threshold_hours,
+            &form.digest_hour,
+            &form.timezone,
+            &installations,
+            Some(&format!("Unknown timezone: {}", form.timezone)),
+        )
+        .into_response());
+    }
+
+    sqlx::query!(
+        "UPDATE users SET threshold_hours = $1, digest_hour = $2, timezone = $3 WHERE user_id = $4",
+        form.threshold_hours,
+        form.digest_hour,
+        form.timezone,
+        user.user_id
+    )
+    .execute(&state.db)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Redirect::to("/settings").into_response())
 }
 
 /// `POST /logout` — detach the user from the session (the anonymous session
@@ -245,12 +550,18 @@ async fn disconnect(
 mod tests {
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+        http::{Request, StatusCode, header},
     };
+    use chrono::{Duration, Utc};
+    use sqlx::PgPool;
     use tower::ServiceExt as _;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_string_contains, method, path},
+    };
 
     use super::*;
-    use crate::state::test_support::lazy_test_state;
+    use crate::state::test_support::{lazy_test_state, test_config, test_state};
 
     fn test_app(state: &AppState) -> Router {
         routes()
@@ -293,5 +604,736 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("login-link"));
         assert!(body.contains("Intl.DateTimeFormat().resolvedOptions().timeZone"));
+    }
+
+    // --- Helpers for authed route tests ---
+
+    async fn mock_backed_state(db: PgPool) -> (AppState, MockServer) {
+        let mock = MockServer::start().await;
+        let mut config = test_config();
+        config.github_oauth_base = mock.uri();
+        config.github_api_base = mock.uri();
+        (test_state(db, config), mock)
+    }
+
+    fn cookie_header(response: &axum::response::Response) -> String {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().split(';').next().unwrap())
+            .filter(|pair| {
+                pair.split_once('=')
+                    .is_some_and(|(_, value)| !value.is_empty())
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn location(response: &axum::response::Response) -> &str {
+        response
+            .headers()
+            .get(header::LOCATION)
+            .expect("expected a Location header")
+            .to_str()
+            .unwrap()
+    }
+
+    async fn do_login(app: &Router, uri: &str) -> (String, String) {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let authorize_url = url::Url::parse(location(&response)).unwrap();
+        let state = authorize_url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .expect("authorize URL must carry a state param")
+            .1
+            .to_string();
+
+        (state, cookie_header(&response))
+    }
+
+    async fn do_callback(
+        app: &Router,
+        state_param: &str,
+        cookies: &str,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::get(format!("/callback?code=test-code&state={state_param}"))
+                    .header(header::COOKIE, cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn full_sign_in(app: &Router, _db: &PgPool) -> String {
+        let (oauth_state, cookies) = do_login(app, "/login").await;
+        let response = do_callback(app, &oauth_state, &cookies).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        cookie_header(&response)
+    }
+
+    fn post_form(uri: &str, cookies: &str, body: String) -> Request<Body> {
+        Request::post(uri)
+            .header(header::COOKIE, cookies)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn csrf_hex(db: &PgPool) -> String {
+        let token = sqlx::query_scalar!("SELECT csrf_token FROM user_sessions")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        hex::encode(token)
+    }
+
+    async fn mount_token_exchange(mock: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .and(body_string_contains("code=test-code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gho_test_access",
+                "refresh_token": "ghr_test_refresh",
+                "expires_in": 28800,
+                "refresh_token_expires_in": 15_897_600,
+                "token_type": "bearer",
+                "scope": ""
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_user_endpoints(mock: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "viewer": { "login": "coreyja", "databaseId": 12345 } }
+            })))
+            .mount(mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/user/emails"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "email": "corey@example.com", "primary": true, "verified": true }
+            ])))
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_installations(mock: &MockServer, installations: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/user/installations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": installations.as_array().map_or(0, Vec::len),
+                "installations": installations
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    /// Insert a pending review row directly for testing.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_review(
+        db: &PgPool,
+        user_id: Uuid,
+        review_id: &str,
+        pr_title: &str,
+        repo: &str,
+        comment_count: i32,
+        last_comment_at: chrono::DateTime<chrono::Utc>,
+        is_backlog: bool,
+    ) -> Uuid {
+        let row = sqlx::query!(
+            "INSERT INTO pending_reviews (
+                review_id, user_id, pr_url, pr_title, repo_name_with_owner,
+                comment_count, last_comment_at, last_seen_at, is_backlog
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id",
+            review_id,
+            user_id,
+            format!("https://github.com/{}/pull/1", repo),
+            pr_title,
+            repo,
+            comment_count,
+            last_comment_at,
+            Utc::now(),
+            is_backlog,
+        )
+        .fetch_one(db)
+        .await
+        .unwrap();
+        row.id
+    }
+
+    // --- Dashboard tests ---
+
+    #[sqlx::test]
+    async fn dashboard_shows_pending_reviews(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let user_id: Uuid = sqlx::query_scalar!("SELECT user_id FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        insert_review(
+            &db,
+            user_id,
+            "R1",
+            "Fix the bug",
+            "o/r",
+            2,
+            Utc::now() - Duration::hours(5),
+            false,
+        )
+        .await;
+        insert_review(
+            &db,
+            user_id,
+            "R2",
+            "Backlog item",
+            "o/r2",
+            1,
+            Utc::now() - Duration::hours(10),
+            true,
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/dashboard")
+                    .header(header::COOKIE, &session_cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        // Email-eligible review is present
+        assert!(body.contains("Fix the bug"));
+        assert!(body.contains("o/r"));
+        // Backlog review is present
+        assert!(body.contains("Backlog item"));
+        assert!(body.contains("o/r2"));
+        // Links point to /files
+        assert!(body.contains("/files"));
+        // Dismiss buttons present
+        assert!(body.contains("/dismiss/"));
+    }
+
+    #[sqlx::test]
+    async fn dashboard_hides_dismissed_reviews(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let user_id: Uuid = sqlx::query_scalar!("SELECT user_id FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        let _active_id = insert_review(
+            &db,
+            user_id,
+            "R1",
+            "Active PR",
+            "o/r",
+            1,
+            Utc::now() - Duration::hours(3),
+            false,
+        )
+        .await;
+        insert_review(
+            &db,
+            user_id,
+            "R2",
+            "Dismissed PR",
+            "o/r2",
+            1,
+            Utc::now() - Duration::hours(3),
+            false,
+        )
+        .await;
+
+        // Dismiss the second one
+        sqlx::query!("UPDATE pending_reviews SET dismissed_at = now() WHERE review_id = 'R2'")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/dashboard")
+                    .header(header::COOKIE, &session_cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("Active PR"));
+        assert!(!body.contains("Dismissed PR"));
+    }
+
+    #[sqlx::test]
+    async fn dashboard_escapes_xss_in_titles(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let user_id: Uuid = sqlx::query_scalar!("SELECT user_id FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        insert_review(
+            &db,
+            user_id,
+            "RX",
+            "<script>alert('xss')</script>",
+            "o/r",
+            1,
+            Utc::now() - Duration::hours(3),
+            false,
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/dashboard")
+                    .header(header::COOKIE, &session_cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        // maud auto-escapes: the script tag must not appear as raw HTML
+        assert!(!body.contains("<script>alert('xss')</script>"));
+        assert!(body.contains("&lt;script&gt;"));
+    }
+
+    // --- Dismiss tests ---
+
+    #[sqlx::test]
+    async fn dismiss_requires_csrf(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let user_id: Uuid = sqlx::query_scalar!("SELECT user_id FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        let review_id = insert_review(
+            &db,
+            user_id,
+            "R1",
+            "Test PR",
+            "o/r",
+            1,
+            Utc::now() - Duration::hours(3),
+            false,
+        )
+        .await;
+
+        // No CSRF token
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                &format!("/dismiss/{}", review_id),
+                &session_cookies,
+                String::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Wrong CSRF token
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                &format!("/dismiss/{}", review_id),
+                &session_cookies,
+                format!("csrf={}", "0".repeat(64)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Row untouched
+        let dismissed: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
+            "SELECT dismissed_at FROM pending_reviews WHERE id = $1",
+            review_id
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(dismissed.is_none());
+    }
+
+    #[sqlx::test]
+    async fn dismiss_with_valid_csrf_sets_dismissed_at(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let csrf = csrf_hex(&db).await;
+        let user_id: Uuid = sqlx::query_scalar!("SELECT user_id FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        let review_id = insert_review(
+            &db,
+            user_id,
+            "R1",
+            "Test PR",
+            "o/r",
+            1,
+            Utc::now() - Duration::hours(3),
+            false,
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                &format!("/dismiss/{}", review_id),
+                &session_cookies,
+                format!("csrf={csrf}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&response), "/dashboard");
+
+        let dismissed: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
+            "SELECT dismissed_at FROM pending_reviews WHERE id = $1",
+            review_id
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(dismissed.is_some());
+    }
+
+    #[sqlx::test]
+    async fn dismiss_is_user_scoped(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let csrf = csrf_hex(&db).await;
+
+        // User A (signed in) has a review. User B has a separate review.
+        let _user_a: Uuid = sqlx::query_scalar!("SELECT user_id FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        let user_b = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO users (
+                user_id, github_login, github_user_id, access_token_enc,
+                refresh_token_enc, token_expires_at, email
+            )
+            VALUES ($1, 'other', 99999, $2, $3, $4, 'other@example.com')",
+            user_b,
+            state.crypto.encrypt("tok", user_b.as_bytes()).unwrap(),
+            state.crypto.encrypt("ref", user_b.as_bytes()).unwrap(),
+            Utc::now() + Duration::days(30),
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let review_b_id = insert_review(
+            &db,
+            user_b,
+            "RB",
+            "Other user PR",
+            "o/r3",
+            1,
+            Utc::now() - Duration::hours(3),
+            false,
+        )
+        .await;
+
+        // User A tries to dismiss user B's review
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                &format!("/dismiss/{}", review_b_id),
+                &session_cookies,
+                format!("csrf={csrf}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // User B's row is untouched
+        let dismissed: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
+            "SELECT dismissed_at FROM pending_reviews WHERE id = $1",
+            review_b_id
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(dismissed.is_none());
+    }
+
+    // --- Settings tests ---
+
+    #[sqlx::test]
+    async fn settings_shows_current_values(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/settings")
+                    .header(header::COOKIE, &session_cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        // Default values
+        assert!(body.contains("threshold_hours"));
+        assert!(body.contains("digest_hour"));
+        assert!(body.contains("timezone"));
+        assert!(body.contains("UTC")); // default timezone
+    }
+
+    #[sqlx::test]
+    async fn settings_update_changes_values(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let csrf = csrf_hex(&db).await;
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/settings",
+                &session_cookies,
+                format!("csrf={csrf}&threshold_hours=8&digest_hour=14&timezone=America/New_York"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&response), "/settings");
+
+        let user = sqlx::query!("SELECT threshold_hours, digest_hour, timezone FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(user.threshold_hours, 8);
+        assert_eq!(user.digest_hour, 14);
+        assert_eq!(user.timezone, "America/New_York");
+    }
+
+    #[sqlx::test]
+    async fn settings_rejects_invalid_timezone(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let csrf = csrf_hex(&db).await;
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/settings",
+                &session_cookies,
+                format!("csrf={csrf}&threshold_hours=4&digest_hour=9&timezone=Not/A/Zone"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Unknown timezone"));
+
+        // Values unchanged
+        let user = sqlx::query!("SELECT timezone FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(user.timezone, "UTC");
+    }
+
+    #[sqlx::test]
+    async fn settings_rejects_invalid_threshold(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let csrf = csrf_hex(&db).await;
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/settings",
+                &session_cookies,
+                format!("csrf={csrf}&threshold_hours=0&digest_hour=9&timezone=UTC"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Threshold must be at least 1"));
+
+        // Values unchanged
+        let user = sqlx::query!("SELECT threshold_hours FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(user.threshold_hours, 4); // default
+    }
+
+    #[sqlx::test]
+    async fn settings_rejects_invalid_digest_hour(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+        let csrf = csrf_hex(&db).await;
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/settings",
+                &session_cookies,
+                format!("csrf={csrf}&threshold_hours=4&digest_hour=25&timezone=UTC"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Digest hour must be between 0 and 23"));
+
+        let user = sqlx::query!("SELECT digest_hour FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(user.digest_hour, 9); // default
+    }
+
+    #[sqlx::test]
+    async fn settings_requires_csrf(db: PgPool) {
+        let (state, mock) = mock_backed_state(db.clone()).await;
+        mount_token_exchange(&mock).await;
+        mount_user_endpoints(&mock).await;
+        mount_installations(&mock, serde_json::json!([])).await;
+        let app = test_app(&state);
+
+        let session_cookies = full_sign_in(&app, &db).await;
+
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/settings",
+                &session_cookies,
+                "threshold_hours=8&digest_hour=14&timezone=UTC".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Values unchanged
+        let user = sqlx::query!("SELECT threshold_hours FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(user.threshold_hours, 4);
     }
 }

@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, pr_title, repo_name_with_owner, pr_url, comment_count, last_comment_at\n             FROM pending_reviews\n             WHERE user_id = $1\n               AND is_backlog = false\n               AND dismissed_at IS NULL\n               AND now() - last_comment_at > make_interval(hours => $2)\n               AND (notified_at IS NULL OR notified_at < now() - interval '7 days')\n             ORDER BY last_comment_at ASC\n             LIMIT 20",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "pr_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "repo_name_with_owner",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "pr_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "comment_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_comment_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "47983e470ab4de21622e8006463bc30222a53dc0eaf0ea018af7c00960b8aa60"
+}

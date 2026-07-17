@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT notified_at FROM pending_reviews WHERE review_id = 'R2'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "notified_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c1925f3b1a6ecfcae478b2962131bb8dfa01b98457b1d565e49d09345a37afbf"
+}

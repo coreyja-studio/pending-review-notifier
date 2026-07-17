@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use cja::server::cookies::CookieKey;
 use color_eyre::eyre::Context as _;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
-use crate::crypto::TokenCrypto;
+use crate::{crypto::TokenCrypto, email::Mailer};
 
 /// GitHub requires a User-Agent on every API request.
 pub const USER_AGENT: &str = "pending-review-notifier (coreyja-studio)";
@@ -21,6 +23,10 @@ pub struct AppConfig {
     pub github_api_base: String,
     /// OAuth web-flow base (default `https://github.com`).
     pub github_oauth_base: String,
+    /// MailPace API token; when `None`, the [`StdoutSender`](crate::email::StdoutSender) is used.
+    pub mailpace_token: Option<String>,
+    /// From-address for digest emails.
+    pub mail_from: String,
 }
 
 impl AppConfig {
@@ -36,6 +42,9 @@ impl AppConfig {
                 .unwrap_or_else(|_| "https://api.github.com".to_string()),
             github_oauth_base: std::env::var("GITHUB_OAUTH_BASE")
                 .unwrap_or_else(|_| "https://github.com".to_string()),
+            mailpace_token: std::env::var("MAILPACE_TOKEN").ok(),
+            mail_from: std::env::var("MAIL_FROM")
+                .unwrap_or_else(|_| "Pending Review Notifier <prn@coreyja.studio>".to_string()),
         })
     }
 }
@@ -49,6 +58,8 @@ pub struct AppState {
     pub crypto: TokenCrypto,
     /// Shared HTTP client for all GitHub calls (sets the required User-Agent).
     pub http: reqwest::Client,
+    /// Email sender (MailPace or StdoutSender fallback).
+    pub mailer: Arc<dyn Mailer>,
 }
 
 impl AppState {
@@ -80,12 +91,15 @@ impl AppState {
             .build()
             .wrap_err("Failed to build HTTP client")?;
 
+        let mailer = crate::email::build_mailer(&config, http.clone());
+
         Ok(Self {
             db,
             cookie_key,
             config,
             crypto,
             http,
+            mailer,
         })
     }
 }
@@ -145,10 +159,22 @@ pub mod test_support {
             // accidentally makes a real HTTP call fails loudly.
             github_api_base: "https://api.github.invalid".to_string(),
             github_oauth_base: "https://github.invalid".to_string(),
+            mailpace_token: None,
+            mail_from: "Pending Review Notifier <prn@coreyja.studio>".to_string(),
         }
     }
 
     pub fn test_state(db: PgPool, config: AppConfig) -> AppState {
+        test_state_with_mailer(db, config, Arc::new(crate::email::StdoutSender))
+    }
+
+    /// Same as [`test_state`] but with a custom mailer — the injection seam
+    /// for `CapturingSender` in `SendDigest` tests.
+    pub fn test_state_with_mailer(
+        db: PgPool,
+        config: AppConfig,
+        mailer: Arc<dyn crate::email::Mailer>,
+    ) -> AppState {
         AppState {
             db,
             cookie_key: CookieKey::generate(),
@@ -159,6 +185,7 @@ pub mod test_support {
                 .build()
                 .expect("test HTTP client must build"),
             config,
+            mailer,
         }
     }
 

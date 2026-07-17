@@ -1,5 +1,6 @@
 use chrono::Utc;
 use cja::jobs::Job;
+use maud::{DOCTYPE, html};
 use uuid::Uuid;
 
 use crate::{discovery, github::oauth, state::AppState};
@@ -121,12 +122,162 @@ impl Job<AppState> for SyncUser {
     }
 }
 
-cja::impl_job_registry!(AppState, SyncUser);
+cja::impl_job_registry!(AppState, SyncUser, SendDigest);
+
+/// A pending-review row selected for the digest email.
+///
+/// All columns are `NOT NULL`, so fields are non-`Option`.
+struct DigestReviewRow {
+    id: Uuid,
+    pr_title: String,
+    repo_name_with_owner: String,
+    pr_url: String,
+    comment_count: i32,
+    last_comment_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Send a digest email for a user's email-eligible pending reviews.
+///
+/// Selects rows where `is_backlog = false`, `dismissed_at IS NULL`, the staleness
+/// threshold is exceeded (strict `>`, matching `discovery::is_stale`), and the
+/// per-review dedup (`notified_at`) allows re-nagging after 7 days.
+///
+/// If no rows match, sends nothing and does NOT stamp `last_digest_at` — a quiet
+/// morning doesn't suppress a later digest. If rows match, sends ONE email
+/// (capped at 20 items), stamps `notified_at` on each, and stamps
+/// `users.last_digest_at`.
+///
+/// Retry semantics: if the job dies after `mailer.send` but before the stamps,
+/// a retry re-sends (duplicate email) — accepted (a dup beats a miss). Job
+/// `Err` is caught by the worker (retry/backoff), never crashes the app.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SendDigest {
+    pub user_id: Uuid,
+}
+
+#[async_trait::async_trait]
+impl Job<AppState> for SendDigest {
+    const NAME: &'static str = "SendDigest";
+
+    async fn run(&self, state: AppState) -> cja::Result<()> {
+        let Some(user) = sqlx::query!(
+            "SELECT threshold_hours, email FROM users WHERE user_id = $1 AND status = 'active'",
+            self.user_id
+        )
+        .fetch_optional(&state.db)
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let reviews = sqlx::query_as!(
+            DigestReviewRow,
+            "SELECT id, pr_title, repo_name_with_owner, pr_url, comment_count, last_comment_at
+             FROM pending_reviews
+             WHERE user_id = $1
+               AND is_backlog = false
+               AND dismissed_at IS NULL
+               AND now() - last_comment_at > make_interval(hours => $2)
+               AND (notified_at IS NULL OR notified_at < now() - interval '7 days')
+             ORDER BY last_comment_at ASC
+             LIMIT 20",
+            self.user_id,
+            user.threshold_hours,
+        )
+        .fetch_all(&state.db)
+        .await?;
+
+        if reviews.is_empty() {
+            return Ok(());
+        }
+
+        let html_body = render_digest_email(&reviews);
+        state
+            .mailer
+            .send(&user.email, "Your pending reviews", &html_body)
+            .await?;
+
+        let ids: Vec<Uuid> = reviews.iter().map(|r| r.id).collect();
+        sqlx::query!(
+            "UPDATE pending_reviews SET notified_at = now() WHERE id = ANY($1)",
+            &ids
+        )
+        .execute(&state.db)
+        .await?;
+        sqlx::query!(
+            "UPDATE users SET last_digest_at = now() WHERE user_id = $1",
+            self.user_id
+        )
+        .execute(&state.db)
+        .await?;
+
+        tracing::info!(
+            user_id = %self.user_id,
+            review_count = reviews.len(),
+            "SendDigest: email sent"
+        );
+
+        Ok(())
+    }
+}
+
+/// Human-readable age from `last_comment_at` to now (e.g. "3d", "2w", "5h", "12m").
+fn format_age(last_comment_at: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed = chrono::Utc::now() - last_comment_at;
+    if elapsed.num_days() >= 7 {
+        format!("{}w", elapsed.num_days() / 7)
+    } else if elapsed.num_days() > 0 {
+        format!("{}d", elapsed.num_days())
+    } else if elapsed.num_hours() > 0 {
+        format!("{}h", elapsed.num_hours())
+    } else {
+        format!("{}m", elapsed.num_minutes().max(0))
+    }
+}
+
+/// Render the digest email HTML body. Inline styles only (email clients strip
+/// `<style>`/external CSS). Auto-escaped text (no `PreEscaped` on
+/// `pr_title`/`repo_name_with_owner`).
+fn render_digest_email(reviews: &[DigestReviewRow]) -> String {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Your pending reviews" }
+            }
+            body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 16px;" {
+                h1 { "Pending Review Notifier" }
+                p { "You have pending reviews that have been sitting for a while:" }
+                ul {
+                    @for review in reviews {
+                        li style="margin-bottom: 12px;" {
+                            a href=(format!("{}/files", review.pr_url))
+                                style="font-weight: bold;" { (review.pr_title) }
+                            " — " (review.repo_name_with_owner)
+                            " (" (review.comment_count) " comments, "
+                            (format_age(review.last_comment_at)) " old)"
+                        }
+                    }
+                }
+                p style="color: #888; margin-top: 24px; font-size: 0.85em;" {
+                    "You received this because you have pending GitHub reviews. "
+                    "Dismiss reviews on your "
+                    a href="https://prn.coreyja.studio/dashboard" { "dashboard" }
+                    " to stop notifications for them."
+                }
+            }
+        }
+    }
+    .into_string()
+}
 
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Duration, Utc};
     use sqlx::PgPool;
+    use std::sync::Arc;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, method, path},
@@ -355,5 +506,398 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining, vec!["R1".to_string()], "R2 reaped, R1 kept");
+    }
+
+    // --- SendDigest tests ---
+
+    async fn insert_user_for_digest(db: &PgPool, threshold_hours: i32) -> Uuid {
+        let state = test_state(db.clone(), test_config());
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO users (
+                user_id, github_login, github_user_id, access_token_enc,
+                refresh_token_enc, token_expires_at, email, threshold_hours
+            )
+            VALUES ($1, 'coreyja', 12345, $2, $3, $4, 'corey@example.com', $5)",
+            user_id,
+            state.crypto.encrypt("tok", user_id.as_bytes()).unwrap(),
+            state.crypto.encrypt("ref", user_id.as_bytes()).unwrap(),
+            Utc::now() + Duration::days(30),
+            threshold_hours,
+        )
+        .execute(db)
+        .await
+        .unwrap();
+        user_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_digest_review(
+        db: &PgPool,
+        user_id: Uuid,
+        review_id: &str,
+        pr_title: &str,
+        last_comment_at: chrono::DateTime<Utc>,
+        is_backlog: bool,
+        dismissed_at: Option<chrono::DateTime<Utc>>,
+        notified_at: Option<chrono::DateTime<Utc>>,
+    ) -> Uuid {
+        let row = sqlx::query!(
+            "INSERT INTO pending_reviews (
+                review_id, user_id, pr_url, pr_title, repo_name_with_owner,
+                comment_count, last_comment_at, last_seen_at, is_backlog,
+                dismissed_at, notified_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING id",
+            review_id,
+            user_id,
+            format!("https://github.com/o/r/pull/{}", review_id),
+            pr_title,
+            "o/r",
+            1,
+            last_comment_at,
+            Utc::now(),
+            is_backlog,
+            dismissed_at,
+            notified_at,
+        )
+        .fetch_one(db)
+        .await
+        .unwrap();
+        row.id
+    }
+
+    #[sqlx::test]
+    async fn send_digest_emails_eligible_reviews(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_digest(&db, 4).await;
+
+        // Eligible: stale (5h > 4h), not backlog, not dismissed, not notified
+        insert_digest_review(
+            &db,
+            user_id,
+            "R1",
+            "Stale PR",
+            Utc::now() - Duration::hours(5),
+            false,
+            None,
+            None,
+        )
+        .await;
+        // Ineligible: not stale (1h < 4h)
+        insert_digest_review(
+            &db,
+            user_id,
+            "R2",
+            "Fresh PR",
+            Utc::now() - Duration::hours(1),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        SendDigest { user_id }.run(state).await.unwrap();
+
+        {
+            let sent = capturing.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].to, "corey@example.com");
+            assert!(sent[0].html_body.contains("Stale PR"));
+            assert!(!sent[0].html_body.contains("Fresh PR"));
+        }
+
+        // notified_at stamped on eligible row only
+        let notified: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT notified_at FROM pending_reviews WHERE review_id = 'R1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(notified.is_some());
+        let notified_r2: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar!("SELECT notified_at FROM pending_reviews WHERE review_id = 'R2'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(notified_r2.is_none());
+
+        // last_digest_at stamped
+        let last_digest: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
+            "SELECT last_digest_at FROM users WHERE user_id = $1",
+            user_id
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(last_digest.is_some());
+    }
+
+    #[sqlx::test]
+    async fn send_digest_staleness_boundary(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_digest(&db, 4).await;
+
+        // Just under threshold (4h - 1s) → NOT eligible (strict >)
+        insert_digest_review(
+            &db,
+            user_id,
+            "R_AT",
+            "At threshold",
+            Utc::now() - Duration::hours(4) + Duration::seconds(1),
+            false,
+            None,
+            None,
+        )
+        .await;
+        // Just past threshold → eligible
+        insert_digest_review(
+            &db,
+            user_id,
+            "R_PAST",
+            "Past threshold",
+            Utc::now() - Duration::hours(4) - Duration::seconds(1),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        SendDigest { user_id }.run(state).await.unwrap();
+
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].html_body.contains("Past threshold"));
+        assert!(!sent[0].html_body.contains("At threshold"));
+    }
+
+    #[sqlx::test]
+    async fn send_digest_per_review_dedup(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_digest(&db, 4).await;
+
+        // notified_at < 7 days ago → excluded
+        insert_digest_review(
+            &db,
+            user_id,
+            "R_RECENT",
+            "Recently notified",
+            Utc::now() - Duration::hours(10),
+            false,
+            None,
+            Some(Utc::now() - Duration::days(3)),
+        )
+        .await;
+        // notified_at > 7 days ago → included
+        insert_digest_review(
+            &db,
+            user_id,
+            "R_OLD",
+            "Old notification",
+            Utc::now() - Duration::hours(10),
+            false,
+            None,
+            Some(Utc::now() - Duration::days(8)),
+        )
+        .await;
+
+        SendDigest { user_id }.run(state).await.unwrap();
+
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].html_body.contains("Old notification"));
+        assert!(!sent[0].html_body.contains("Recently notified"));
+    }
+
+    #[sqlx::test]
+    async fn send_digest_excludes_backlog_and_dismissed(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_digest(&db, 4).await;
+
+        // Backlog → excluded
+        insert_digest_review(
+            &db,
+            user_id,
+            "R_BACK",
+            "Backlog",
+            Utc::now() - Duration::hours(10),
+            true,
+            None,
+            None,
+        )
+        .await;
+        // Dismissed → excluded
+        insert_digest_review(
+            &db,
+            user_id,
+            "R_DISM",
+            "Dismissed",
+            Utc::now() - Duration::hours(10),
+            false,
+            Some(Utc::now()),
+            None,
+        )
+        .await;
+        // Eligible
+        insert_digest_review(
+            &db,
+            user_id,
+            "R_OK",
+            "OK",
+            Utc::now() - Duration::hours(10),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        SendDigest { user_id }.run(state).await.unwrap();
+
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].html_body.contains("OK"));
+        assert!(!sent[0].html_body.contains("Backlog"));
+        assert!(!sent[0].html_body.contains("Dismissed"));
+    }
+
+    #[sqlx::test]
+    async fn send_digest_caps_at_20(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_digest(&db, 4).await;
+
+        for i in 0..25 {
+            insert_digest_review(
+                &db,
+                user_id,
+                &format!("R{}", i),
+                &format!("PR {}", i),
+                Utc::now() - Duration::hours(5),
+                false,
+                None,
+                None,
+            )
+            .await;
+        }
+
+        SendDigest { user_id }.run(state).await.unwrap();
+
+        {
+            let sent = capturing.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            // Count the number of <li> items in the HTML
+            let li_count = sent[0].html_body.matches("<li").count();
+            assert_eq!(li_count, 20);
+        }
+
+        // All 20 eligible rows stamped
+        let notified_count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM pending_reviews WHERE user_id = $1 AND notified_at IS NOT NULL",
+            user_id
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(notified_count, Some(20));
+    }
+
+    #[sqlx::test]
+    async fn send_digest_no_eligible_no_email(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_digest(&db, 4).await;
+
+        // Only fresh review → not eligible
+        insert_digest_review(
+            &db,
+            user_id,
+            "R1",
+            "Fresh",
+            Utc::now() - Duration::hours(1),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        SendDigest { user_id }.run(state).await.unwrap();
+
+        {
+            let sent = capturing.sent.lock().unwrap();
+            assert_eq!(sent.len(), 0);
+        }
+
+        // last_digest_at NOT stamped on quiet morning
+        let last_digest: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
+            "SELECT last_digest_at FROM users WHERE user_id = $1",
+            user_id
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(last_digest.is_none());
+    }
+
+    #[sqlx::test]
+    async fn send_digest_skips_inactive_user(db: PgPool) {
+        let capturing = Arc::new(crate::email::CapturingSender::default());
+        let state = crate::state::test_support::test_state_with_mailer(
+            db.clone(),
+            test_config(),
+            capturing.clone(),
+        );
+        let user_id = insert_user_for_digest(&db, 4).await;
+        sqlx::query!(
+            "UPDATE users SET status = 'paused' WHERE user_id = $1",
+            user_id
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        insert_digest_review(
+            &db,
+            user_id,
+            "R1",
+            "Stale",
+            Utc::now() - Duration::hours(10),
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        SendDigest { user_id }.run(state).await.unwrap();
+
+        let sent = capturing.sent.lock().unwrap();
+        assert_eq!(sent.len(), 0);
     }
 }
