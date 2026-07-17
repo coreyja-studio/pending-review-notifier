@@ -5,10 +5,5 @@
     ".": {
       "include-component-in-tag": false
     }
-  },
-  "plugins": [
-    {
-      "type": "cargo-workspace"
-    }
-  ]
+  }
 }

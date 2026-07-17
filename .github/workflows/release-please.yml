@@ -9,6 +9,12 @@ permissions:
   contents: write
   pull-requests: write
 
+# Two rapid pushes to main race two release-please runs; the action is
+# idempotent but the duplicate run is noise. Queue, never cancel.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
 jobs:
   release-please:
     name: Release PR / tag
