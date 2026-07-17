@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1](https://github.com/coreyja-studio/pending-review-notifier/compare/v0.2.0...v0.2.1) (2026-07-17)
+
+
+### Features
+
+* pause reminders + List-Unsubscribe one-click ([#12](https://github.com/coreyja-studio/pending-review-notifier/issues/12)) ([c92acaa](https://github.com/coreyja-studio/pending-review-notifier/commit/c92acaa06439374148ca027a0c570a6e812ad66d))
+
+
+### Bug Fixes
+
+* send Accept header to MailPace (406 without it) ([#14](https://github.com/coreyja-studio/pending-review-notifier/issues/14)) ([72dbb07](https://github.com/coreyja-studio/pending-review-notifier/commit/72dbb0700a118a0250f2356efbc13231e47f31b4))
+
 ## [0.2.0](https://github.com/coreyja-studio/pending-review-notifier/compare/v0.1.0...v0.2.0) (2026-07-17)
 
 
