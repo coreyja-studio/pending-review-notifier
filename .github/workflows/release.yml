@@ -1,17 +1,30 @@
 name: Release
 
+# Normally called by release-please.yml right after it tags a release (tags
+# created with GITHUB_TOKEN don't trigger tag-push workflows, so the call
+# must happen in the same run). The tag-push trigger is the manual fallback:
+# push a v* tag by hand and this still builds + uploads.
 on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag_name:
+        description: "Tag to build and release (e.g. v0.2.0)"
+        required: true
+        type: string
 
 env:
   CARGO_INCREMENTAL: 0
+  # The tag being released: the workflow_call input when release-please is
+  # driving, the pushed tag otherwise.
+  TAG: ${{ inputs.tag_name || github.ref_name }}
 
-# A duplicate push of the same tag must queue behind the first run, never
-# cancel it — a cancelled build matrix leaves a release with missing assets.
+# A duplicate run for the same tag must queue behind the first, never cancel
+# it — a cancelled build matrix leaves a release with missing assets.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -37,7 +50,11 @@ jobs:
       # DATABASE_URL at build time.
       SQLX_OFFLINE: "true"
     steps:
+      # When release-please calls this workflow the run is on the main-branch
+      # push event, so check out the tag explicitly to build the tagged commit.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Install rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -67,6 +84,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -79,15 +98,17 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        # Re-run safe: if the release already exists (earlier run made it past
-        # this step, or a partial retry), replace its assets instead of failing.
+        # Re-run safe: if the release already exists (release-please created
+        # it, an earlier run made it past this step, or a partial retry),
+        # replace its assets instead of failing. The create path only runs for
+        # manual tag pushes.
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --clobber \
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber \
               dist/prn-check-*.tar.gz dist/SHA256SUMS
           else
-            gh release create "$GITHUB_REF_NAME" \
-              --title "$GITHUB_REF_NAME" \
+            gh release create "$TAG" \
+              --title "$TAG" \
               --generate-notes \
               dist/prn-check-*.tar.gz dist/SHA256SUMS
           fi
