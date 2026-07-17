@@ -85,6 +85,8 @@ impl Mailer for MailPaceSender {
             .http
             .post(&self.url)
             .header("MailPace-Server-Token", &self.token)
+            // MailPace returns 406 Not Acceptable without an explicit JSON Accept.
+            .header("Accept", "application/json")
             .json(&body)
             .send()
             .await
@@ -197,6 +199,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/send"))
             .and(header("MailPace-Server-Token", "test-token"))
+            .and(header("Accept", "application/json"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&mock)
             .await;
