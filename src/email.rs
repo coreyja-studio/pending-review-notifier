@@ -13,9 +13,23 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 /// Send an HTML email to a single recipient.
+///
+/// `list_unsubscribe` is the value for the `List-Unsubscribe` header, e.g.
+/// `<https://prn.coreyja.studio/unsubscribe/{token}>` (angle brackets
+/// included, per RFC 2369). MailPace exposes this as a dedicated
+/// `list_unsubscribe` field on its send API; it has no custom-headers
+/// support, so the RFC 8058 `List-Unsubscribe-Post: List-Unsubscribe=One-Click`
+/// companion header cannot be set — our POST endpoint still accepts the
+/// one-click body for providers that send it anyway.
 #[async_trait]
 pub trait Mailer: Send + Sync {
-    async fn send(&self, to: &str, subject: &str, html_body: &str) -> cja::Result<()>;
+    async fn send(
+        &self,
+        to: &str,
+        subject: &str,
+        html_body: &str,
+        list_unsubscribe: Option<&str>,
+    ) -> cja::Result<()>;
 }
 
 /// MailPace API sender. Posts JSON to `https://app.mailpace.com/api/v1/send`
@@ -51,17 +65,27 @@ impl MailPaceSender {
 
 #[async_trait]
 impl Mailer for MailPaceSender {
-    async fn send(&self, to: &str, subject: &str, html_body: &str) -> cja::Result<()> {
+    async fn send(
+        &self,
+        to: &str,
+        subject: &str,
+        html_body: &str,
+        list_unsubscribe: Option<&str>,
+    ) -> cja::Result<()> {
+        let mut body = serde_json::json!({
+            "from": self.from,
+            "to": to,
+            "subject": subject,
+            "htmlbody": html_body,
+        });
+        if let Some(value) = list_unsubscribe {
+            body["list_unsubscribe"] = serde_json::json!(value);
+        }
         let resp = self
             .http
             .post(&self.url)
             .header("MailPace-Server-Token", &self.token)
-            .json(&serde_json::json!({
-                "from": self.from,
-                "to": to,
-                "subject": subject,
-                "htmlbody": html_body,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("MailPace send request failed: {e}"))?;
@@ -83,8 +107,19 @@ pub struct StdoutSender;
 
 #[async_trait]
 impl Mailer for StdoutSender {
-    async fn send(&self, to: &str, subject: &str, html_body: &str) -> cja::Result<()> {
-        tracing::info!(to, subject, "Reminder email (stdout sender):\n{html_body}");
+    async fn send(
+        &self,
+        to: &str,
+        subject: &str,
+        html_body: &str,
+        list_unsubscribe: Option<&str>,
+    ) -> cja::Result<()> {
+        tracing::info!(
+            to,
+            subject,
+            list_unsubscribe,
+            "Reminder email (stdout sender):\n{html_body}"
+        );
         Ok(())
     }
 }
@@ -110,6 +145,7 @@ pub struct CapturedEmail {
     pub to: String,
     pub subject: String,
     pub html_body: String,
+    pub list_unsubscribe: Option<String>,
 }
 
 #[cfg(test)]
@@ -121,11 +157,18 @@ pub struct CapturingSender {
 #[cfg(test)]
 #[async_trait]
 impl Mailer for CapturingSender {
-    async fn send(&self, to: &str, subject: &str, html_body: &str) -> cja::Result<()> {
+    async fn send(
+        &self,
+        to: &str,
+        subject: &str,
+        html_body: &str,
+        list_unsubscribe: Option<&str>,
+    ) -> cja::Result<()> {
         self.sent.lock().unwrap().push(CapturedEmail {
             to: to.to_string(),
             subject: subject.to_string(),
             html_body: html_body.to_string(),
+            list_unsubscribe: list_unsubscribe.map(str::to_string),
         });
         Ok(())
     }
@@ -143,7 +186,7 @@ mod tests {
     async fn stdout_sender_does_not_error() {
         let sender = StdoutSender;
         sender
-            .send("a@b.com", "Subject", "<p>hi</p>")
+            .send("a@b.com", "Subject", "<p>hi</p>", None)
             .await
             .unwrap();
     }
@@ -167,7 +210,40 @@ mod tests {
         );
 
         sender
-            .send("to@test", "Your pending reviews", "<p>hi</p>")
+            .send("to@test", "Your pending reviews", "<p>hi</p>", None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mailpace_sets_list_unsubscribe_field_when_given() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/send"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "list_unsubscribe": "<https://prn.test/unsubscribe/abc>"
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock)
+            .await;
+
+        let http = reqwest::Client::new();
+        let sender = MailPaceSender::with_url(
+            http,
+            "test-token".to_string(),
+            "from@test".to_string(),
+            format!("{}/api/v1/send", mock.uri()),
+        );
+
+        // The mock only matches when the JSON body carries list_unsubscribe;
+        // an unmatched request would 404 and error the send.
+        sender
+            .send(
+                "to@test",
+                "Subject",
+                "<p>hi</p>",
+                Some("<https://prn.test/unsubscribe/abc>"),
+            )
             .await
             .unwrap();
     }
@@ -189,7 +265,7 @@ mod tests {
             format!("{}/api/v1/send", mock.uri()),
         );
 
-        let result = sender.send("to@test", "Subject", "<p>hi</p>").await;
+        let result = sender.send("to@test", "Subject", "<p>hi</p>", None).await;
         assert!(result.is_err());
     }
 }

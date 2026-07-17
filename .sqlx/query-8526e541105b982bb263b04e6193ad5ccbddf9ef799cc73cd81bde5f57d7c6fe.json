@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET reminders_paused = true",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "8526e541105b982bb263b04e6193ad5ccbddf9ef799cc73cd81bde5f57d7c6fe"
+}

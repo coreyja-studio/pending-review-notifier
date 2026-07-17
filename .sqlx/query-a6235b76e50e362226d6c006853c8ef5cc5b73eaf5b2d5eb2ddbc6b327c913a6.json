@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT threshold_hours, email FROM users WHERE user_id = $1 AND status = 'active'",
+  "query": "SELECT threshold_hours, reminders_paused FROM users WHERE user_id = $1",
   "describe": {
     "columns": [
       {
@@ -10,8 +10,8 @@
       },
       {
         "ordinal": 1,
-        "name": "email",
-        "type_info": "Text"
+        "name": "reminders_paused",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -24,5 +24,5 @@
       false
     ]
   },
-  "hash": "5ea671f00d809dc1c079eb59dfb10e46119d7093bb90392cc40bb15ee25abd87"
+  "hash": "a6235b76e50e362226d6c006853c8ef5cc5b73eaf5b2d5eb2ddbc6b327c913a6"
 }
