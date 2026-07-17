@@ -56,28 +56,69 @@ async fn healthz(State(state): State<AppState>) -> String {
     format!("OK {}", state.version())
 }
 
+/// Shared `<head>` for every page. The whole stylesheet is inlined — one
+/// hand-written file, no build step, no extra request.
+fn page_head(title: &str) -> Markup {
+    html! {
+        head {
+            meta charset="utf-8";
+            meta name="viewport" content="width=device-width, initial-scale=1";
+            title { (title) }
+            style { (PreEscaped(include_str!("style.css"))) }
+        }
+    }
+}
+
+/// Signed-in masthead: wordmark, identity, one nav link, logout.
+fn masthead(user: &CurrentUser, on_settings: bool) -> Markup {
+    html! {
+        header class="masthead" {
+            a class="wordmark" href="/dashboard" { "Pending Review Notifier" }
+            nav {
+                span class="whoami" { (user.github_login) }
+                @if on_settings {
+                    a href="/dashboard" { "Dashboard" }
+                } @else {
+                    a href="/settings" { "Settings" }
+                }
+                form method="post" action="/logout" {
+                    input type="hidden" name="csrf" value=(user.csrf_hex());
+                    button type="submit" class="btn-bare" { "Log out" }
+                }
+            }
+        }
+    }
+}
+
+fn page_footer() -> Markup {
+    html! {
+        footer class="footer" { "No tracking. Disconnect deletes everything." }
+    }
+}
+
 async fn landing() -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Pending Review Notifier" }
-            }
+            (page_head("Pending Review Notifier"))
             body {
-                h1 { "Pending Review Notifier" }
-                p {
-                    "GitHub never reminds you about your own unsubmitted pending reviews — \
-                    the comments you wrote but never clicked \"Submit\" on, invisible to \
-                    everyone but you. Pending Review Notifier watches for them and sends \
-                    you a daily digest when one has been sitting longer than your \
-                    threshold, so feedback stops silently rotting in draft."
-                }
-                p {
-                    a href="https://github.com/apps/pending-review-notifier" { "Install" }
-                    " · "
-                    a id="login-link" href="/login" { "Sign in" }
+                div class="wrap" {
+                    main {
+                        h1 { "Pending Review Notifier" }
+                        p class="lede" {
+                            "GitHub never reminds you about your own unsubmitted pending reviews — \
+                            the comments you wrote but never clicked \"Submit\" on, invisible to \
+                            everyone but you. Pending Review Notifier watches for them and sends \
+                            you a daily digest when one has been sitting longer than your \
+                            threshold, so feedback stops silently rotting in draft."
+                        }
+                        div class="actions" {
+                            a class="btn btn-primary" href="https://github.com/apps/pending-review-notifier" { "Install the GitHub App" }
+                            a class="btn" id="login-link" href="/login" { "Sign in" }
+                        }
+                        p class="fine" { "Free. At most one email a day. Nothing stored you can't delete." }
+                    }
+                    (page_footer())
                 }
                 // Capture the browser timezone at signup: rewrite the sign-in
                 // link so /login can stash the tz in the OAuth state cookie.
@@ -144,82 +185,98 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
     Ok(html! {
         (DOCTYPE)
         html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Dashboard — Pending Review Notifier" }
-            }
+            (page_head("Dashboard — Pending Review Notifier"))
             body {
-                h1 { "Dashboard" }
-                p { "Signed in as " strong { (user.github_login) } ". "
-                    a href="/settings" { "Settings" }
-                }
+                div class="wrap" {
+                    (masthead(&user, false))
+                    main {
+                        @if email_eligible.is_empty() && backlog.is_empty() {
+                            p class="empty" { "No pending reviews anywhere. Close the tab." }
+                        } @else {
+                            section class="group" {
+                                header class="group-header" {
+                                    span { "Email-eligible" }
+                                    span class="count" { (email_eligible.len()) }
+                                }
+                                @if email_eligible.is_empty() {
+                                    p class="empty" { "Nothing newly stale. Good." }
+                                } @else {
+                                    ul class="review-list" {
+                                        @for review in &email_eligible {
+                                            li class="review" {
+                                                div class="review-main" {
+                                                    a class="review-title" href=(format!("{}/files", review.pr_url)) { (review.pr_title) }
+                                                    p class="review-meta" {
+                                                        (review.repo_name_with_owner)
+                                                        " · " (review.comment_count)
+                                                        @if review.comment_count == 1 { " comment" } @else { " comments" }
+                                                        " · "
+                                                        span class="age-hot" { (format_age(review.last_comment_at)) }
+                                                        " since last comment"
+                                                    }
+                                                }
+                                                form method="post" action=(format!("/dismiss/{}", review.id)) {
+                                                    input type="hidden" name="csrf" value=(user.csrf_hex());
+                                                    button type="submit" class="btn btn-dismiss" { "Dismiss" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
 
-                h2 { "Pending reviews" }
-                @if email_eligible.is_empty() {
-                    p { "No pending reviews eligible for digest — you're all caught up." }
-                } @else {
-                    ul {
-                        @for review in &email_eligible {
-                            li {
-                                a href=(format!("{}/files", review.pr_url)) { (review.pr_title) }
-                                " — " (review.repo_name_with_owner)
-                                " (" (review.comment_count) " comments, "
-                                (format_age(review.last_comment_at)) " old)"
-                                form method="post" action=(format!("/dismiss/{}", review.id))
-                                    style="display:inline" {
-                                    input type="hidden" name="csrf" value=(user.csrf_hex());
-                                    button type="submit" { "Dismiss" }
+                            section class="group group--backlog" {
+                                header class="group-header" {
+                                    span { "Backlog — already stale when first seen" }
+                                    span class="count" { (backlog.len()) }
+                                }
+                                @if backlog.is_empty() {
+                                    p class="empty" { "Backlog clear." }
+                                } @else {
+                                    ul class="review-list" {
+                                        @for review in &backlog {
+                                            li class="review" {
+                                                div class="review-main" {
+                                                    a class="review-title" href=(format!("{}/files", review.pr_url)) { (review.pr_title) }
+                                                    p class="review-meta" {
+                                                        (review.repo_name_with_owner)
+                                                        " · " (review.comment_count)
+                                                        @if review.comment_count == 1 { " comment" } @else { " comments" }
+                                                        " · " (format_age(review.last_comment_at))
+                                                        " since last comment"
+                                                    }
+                                                }
+                                                form method="post" action=(format!("/dismiss/{}", review.id)) {
+                                                    input type="hidden" name="csrf" value=(user.csrf_hex());
+                                                    button type="submit" class="btn btn-dismiss" { "Dismiss" }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
 
-                h2 { "Backlog" }
-                @if backlog.is_empty() {
-                    p { "No backlog items." }
-                } @else {
-                    ul style="opacity:0.6" {
-                        @for review in &backlog {
-                            li {
-                                a href=(format!("{}/files", review.pr_url)) { (review.pr_title) }
-                                " — " (review.repo_name_with_owner)
-                                " (" (review.comment_count) " comments, "
-                                (format_age(review.last_comment_at)) " old)"
-                                form method="post" action=(format!("/dismiss/{}", review.id))
-                                    style="display:inline" {
-                                    input type="hidden" name="csrf" value=(user.csrf_hex());
-                                    button type="submit" { "Dismiss" }
+                        section class="group" {
+                            header class="group-header" {
+                                span { "Coverage" }
+                            }
+                            @if installations.is_empty() {
+                                p class="empty" { "No installations yet — install the app to get coverage." }
+                            } @else {
+                                ul class="coverage-list" {
+                                    @for installation in &installations {
+                                        li {
+                                            (installation.account_login)
+                                            " · " (installation.repository_selection) " repositories"
+                                        }
+                                    }
                                 }
                             }
+                            p class="fine" { a href=(github::INSTALL_URL) { "Add more repos →" } }
                         }
                     }
-                }
-
-                h2 { "Covered installations" }
-                @if installations.is_empty() {
-                    p { "No installations yet — install the app to get coverage." }
-                } @else {
-                    ul {
-                        @for installation in &installations {
-                            li {
-                                (installation.account_login)
-                                " (" (installation.repository_selection) " repositories)"
-                            }
-                        }
-                    }
-                }
-                p { a href=(github::INSTALL_URL) { "Add more repos" } }
-
-                form method="post" action="/logout" {
-                    input type="hidden" name="csrf" value=(user.csrf_hex());
-                    button type="submit" { "Log out" }
-                }
-                form method="post" action="/disconnect"
-                    onsubmit="return confirm('Disconnect from GitHub and delete all your data? This cannot be undone.')" {
-                    input type="hidden" name="csrf" value=(user.csrf_hex());
-                    button type="submit" { "Disconnect" }
+                    (page_footer())
                 }
             }
         }
@@ -308,61 +365,82 @@ fn settings_page(
     html! {
         (DOCTYPE)
         html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Settings — Pending Review Notifier" }
-            }
+            (page_head("Settings — Pending Review Notifier"))
             body {
-                h1 { "Settings" }
-                p { "Signed in as " strong { (user.github_login) } ". "
-                    a href="/dashboard" { "Back to dashboard" }
-                }
+                div class="wrap" {
+                    (masthead(user, true))
+                    main {
+                        h1 { "Settings" }
 
-                @if let Some(err) = error {
-                    p style="color:red" { (err) }
-                }
+                        @if let Some(err) = error {
+                            p { strong { (err) } }
+                        }
 
-                form method="post" action="/settings" {
-                    input type="hidden" name="csrf" value=(user.csrf_hex());
-                    p {
-                        label { "Threshold (hours): "
-                            input type="number" name="threshold_hours" min="1"
-                                value=(threshold_hours);
+                        form method="post" action="/settings" {
+                            input type="hidden" name="csrf" value=(user.csrf_hex());
+                            div class="field" {
+                                label for="threshold_hours" { "Stale threshold" }
+                                input id="threshold_hours" type="number" name="threshold_hours"
+                                    min="1" value=(threshold_hours);
+                                p class="hint" { "Hours since the last comment before a review counts as stale." }
+                            }
+                            div class="field" {
+                                label for="digest_hour" { "Digest hour" }
+                                select id="digest_hour" name="digest_hour" {
+                                    @for hour in 0..24 {
+                                        option value=(hour) selected[hour == *digest_hour] {
+                                            (format!("{hour:02}:00"))
+                                        }
+                                    }
+                                }
+                                p class="hint" { "Local hour the daily email goes out." }
+                            }
+                            div class="field" {
+                                label for="timezone" { "Timezone" }
+                                select id="timezone" name="timezone" {
+                                    @for tz in chrono_tz::TZ_VARIANTS {
+                                        option value=(tz.name()) selected[tz.name() == timezone] {
+                                            (tz.name())
+                                        }
+                                    }
+                                }
+                            }
+                            button type="submit" class="btn btn-primary" { "Save" }
                         }
-                    }
-                    p {
-                        label { "Digest hour (0-23): "
-                            input type="number" name="digest_hour" min="0" max="23"
-                                value=(digest_hour);
-                        }
-                    }
-                    p {
-                        label { "Timezone (IANA): "
-                            input type="text" name="timezone" value=(timezone);
-                        }
-                    }
-                    button type="submit" { "Save" }
-                }
 
-                h2 { "Covered installations" }
-                @if installations.is_empty() {
-                    p { "No installations yet." }
-                } @else {
-                    ul {
-                        @for installation in installations {
-                            li {
-                                (installation.account_login)
-                                " (" (installation.repository_selection) " repositories)"
+                        section class="group" {
+                            header class="group-header" {
+                                span { "Coverage" }
+                            }
+                            @if installations.is_empty() {
+                                p class="empty" { "No installations yet — install the app to get coverage." }
+                            } @else {
+                                ul class="coverage-list" {
+                                    @for installation in installations {
+                                        li {
+                                            (installation.account_login)
+                                            " · " (installation.repository_selection) " repositories"
+                                        }
+                                    }
+                                }
+                            }
+                            p class="fine" { a href=(github::INSTALL_URL) { "Add more repos →" } }
+                        }
+
+                        section class="danger" {
+                            h2 { "Disconnect" }
+                            p {
+                                "Revokes the GitHub grant and deletes your account, pending \
+                                reviews, and sessions. Cannot be undone."
+                            }
+                            form method="post" action="/disconnect"
+                                onsubmit="return confirm('Disconnect from GitHub and delete all your data? This cannot be undone.')" {
+                                input type="hidden" name="csrf" value=(user.csrf_hex());
+                                button type="submit" class="btn btn-danger" { "Disconnect from GitHub" }
                             }
                         }
                     }
-                }
-
-                form method="post" action="/disconnect"
-                    onsubmit="return confirm('Disconnect from GitHub and delete all your data? This cannot be undone.')" {
-                    input type="hidden" name="csrf" value=(user.csrf_hex());
-                    button type="submit" { "Disconnect" }
+                    (page_footer())
                 }
             }
         }
