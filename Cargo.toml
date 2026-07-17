@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 description = "Pending Review Notifier — nags you about your own forgotten pending GitHub reviews"
 
+# The service binary (`prn`, src/main.rs) is auto-discovered. `prn-check` is the
+# standalone CLI (docs/DESIGN.md "CLI mode"): it links src/discovery.rs directly
+# via #[path] and never touches the web/jobs/DB stack.
+[[bin]]
+name = "prn-check"
+path = "src/prn_check/main.rs"
+
 [dependencies]
 cja = { git = "https://github.com/coreyja/cja", rev = "d23caa0" }
 
@@ -29,6 +36,10 @@ tracing = "0.1"
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
+  # Also trust the OS trust store / SSL_CERT_FILE (in addition to webpki
+  # roots): prn-check runs on user machines, some behind TLS-intercepting
+  # proxies whose CA only exists in the system store.
+  "rustls-tls-native-roots",
   "json",
 ] }
 
