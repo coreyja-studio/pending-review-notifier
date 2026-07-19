@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.2](https://github.com/coreyja-studio/pending-review-notifier/compare/v0.2.1...v0.2.2) (2026-07-19)
+
+
+### Features
+
+* emit Eyes boot manifest at startup ([#19](https://github.com/coreyja-studio/pending-review-notifier/issues/19)) ([7c843fa](https://github.com/coreyja-studio/pending-review-notifier/commit/7c843fa4d79800c8d62c2900df30dbc30f9cb88b))
+
+
+### Bug Fixes
+
+* keep eyes shutdown handle alive so eyes telemetry works ([#15](https://github.com/coreyja-studio/pending-review-notifier/issues/15)) ([72bfd19](https://github.com/coreyja-studio/pending-review-notifier/commit/72bfd19757ea4f2165830b83e44c4b73144b56fa))
+
 ## [0.2.1](https://github.com/coreyja-studio/pending-review-notifier/compare/v0.2.0...v0.2.1) (2026-07-17)
 
 
