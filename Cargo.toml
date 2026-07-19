@@ -1,6 +1,6 @@
 [package]
 name = "prn"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Pending Review Notifier — nags you about your own forgotten pending GitHub reviews"
 repository = "https://github.com/coreyja-studio/pending-review-notifier"
