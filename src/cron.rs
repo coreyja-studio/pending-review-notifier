@@ -21,7 +21,10 @@ const REMINDER_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// closure that returns `Err` propagates up and crashes the whole app, so
 /// [`sync_sweep`] and [`reminder_sweep`] handle every error internally
 /// (log-and-continue) and the wrappers can only ever return `Ok`.
-fn registry() -> CronRegistry<AppState> {
+///
+/// Public so `main` can build the registry once, feed it to the Eyes boot
+/// manifest, then hand the same registry to [`run_cron`].
+pub fn registry() -> CronRegistry<AppState> {
     let mut registry = CronRegistry::new();
     registry.register(
         "SyncSweep",
@@ -110,10 +113,14 @@ async fn reminder_sweep(state: AppState) {
     tracing::info!(active_users = total, "ReminderSweep enqueued");
 }
 
-pub async fn run_cron(app_state: AppState, shutdown_token: CancellationToken) -> cja::Result<()> {
+pub async fn run_cron(
+    app_state: AppState,
+    registry: CronRegistry<AppState>,
+    shutdown_token: CancellationToken,
+) -> cja::Result<()> {
     Worker::new_with_timezone(
         app_state,
-        registry(),
+        registry,
         cja::chrono_tz::UTC,
         Duration::from_secs(60),
     )
