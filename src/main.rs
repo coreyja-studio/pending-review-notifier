@@ -39,6 +39,19 @@ async fn async_main() -> cja::Result<()> {
 
     let app_state = AppState::from_env().await?;
 
+    // Build the cron registry once so it can seed the Eyes boot manifest
+    // before being handed off to the cron worker.
+    let cron_registry = cron::registry();
+
+    // Emit this app's shape (job types, cron schedules, build version) to Eyes
+    // at boot; fire-and-forget and a no-op when EYES_ORG_ID/EYES_APP_ID are
+    // unset. No git SHA is wired into the build, so pass None.
+    cja::eyes_manifest::send_boot_manifest::<jobs::Jobs, AppState>(
+        Some(env!("CARGO_PKG_VERSION")),
+        None,
+        Some(&cron_registry),
+    );
+
     // Cancelled on SIGINT/SIGTERM; the job and cron workers watch it for
     // graceful shutdown.
     let shutdown_token = CancellationToken::new();
@@ -56,7 +69,11 @@ async fn async_main() -> cja::Result<()> {
         shutdown_token.clone(),
         DEFAULT_LOCK_TIMEOUT,
     ));
-    let mut cron = tokio::spawn(cron::run_cron(app_state.clone(), shutdown_token.clone()));
+    let mut cron = tokio::spawn(cron::run_cron(
+        app_state.clone(),
+        cron_registry,
+        shutdown_token.clone(),
+    ));
 
     // Wait for a shutdown signal, or for any task to exit on its own —
     // these are long-running tasks, so an unprompted exit is an error.
