@@ -22,6 +22,22 @@ use crate::{
     state::AppState,
 };
 
+/// Keep response-sized route rejections off the successful result path.
+#[derive(Debug)]
+struct RouteError(Box<Response>);
+
+impl From<Response> for RouteError {
+    fn from(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
+impl axum::response::IntoResponse for RouteError {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
 /// Hidden-input payload carried by every state-changing form.
 #[derive(Deserialize)]
 struct CsrfForm {
@@ -172,7 +188,7 @@ fn format_age(last_comment_at: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, Response> {
+async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, RouteError> {
     let installations = sqlx::query!(
         "SELECT i.account_login, i.repository_selection
          FROM installations i
@@ -324,9 +340,9 @@ async fn dismiss(
     user: CurrentUser,
     AxumPath(review_id): AxumPath<Uuid>,
     Form(form): Form<CsrfForm>,
-) -> Result<Redirect, Response> {
+) -> Result<Redirect, RouteError> {
     if !csrf_matches(&user.csrf_token, form.csrf.as_deref().unwrap_or_default()) {
-        return Err(csrf_rejection());
+        return Err(csrf_rejection().into());
     }
     sqlx::query!(
         "UPDATE pending_reviews SET dismissed_at = now()
@@ -352,7 +368,7 @@ struct SettingsForm {
 }
 
 /// `GET /settings` — render a settings form pre-filled with the user's current values.
-async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, Response> {
+async fn settings(State(state): State<AppState>, user: CurrentUser) -> Result<Markup, RouteError> {
     let user_row = sqlx::query!(
         "SELECT threshold_hours, reminders_paused FROM users WHERE user_id = $1",
         user.user_id
@@ -480,9 +496,9 @@ async fn update_settings(
     State(state): State<AppState>,
     user: CurrentUser,
     Form(form): Form<SettingsForm>,
-) -> Result<Response, Response> {
+) -> Result<Response, RouteError> {
     if !csrf_matches(&user.csrf_token, form.csrf.as_deref().unwrap_or_default()) {
-        return Err(csrf_rejection());
+        return Err(csrf_rejection().into());
     }
 
     let installations = sqlx::query!(
@@ -581,7 +597,7 @@ fn unsubscribe_not_found() -> Response {
 async fn user_for_unsubscribe_token(
     state: &AppState,
     token: &str,
-) -> Result<Option<Uuid>, Response> {
+) -> Result<Option<Uuid>, RouteError> {
     let Ok(token) = token.parse::<Uuid>() else {
         return Ok(None);
     };
@@ -591,7 +607,7 @@ async fn user_for_unsubscribe_token(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(internal_error)
+    .map_err(|error| internal_error(error).into())
 }
 
 /// `GET /unsubscribe/{token}` — confirm page, one button, no login.
@@ -602,9 +618,9 @@ async fn user_for_unsubscribe_token(
 async fn unsubscribe_confirm(
     State(state): State<AppState>,
     AxumPath(token): AxumPath<String>,
-) -> Result<Markup, Response> {
+) -> Result<Markup, RouteError> {
     if user_for_unsubscribe_token(&state, &token).await?.is_none() {
-        return Err(unsubscribe_not_found());
+        return Err(unsubscribe_not_found().into());
     }
 
     Ok(unsubscribe_shell(
@@ -634,9 +650,9 @@ async fn unsubscribe_confirm(
 async fn unsubscribe_pause(
     State(state): State<AppState>,
     AxumPath(token): AxumPath<String>,
-) -> Result<Markup, Response> {
+) -> Result<Markup, RouteError> {
     let Some(user_id) = user_for_unsubscribe_token(&state, &token).await? else {
-        return Err(unsubscribe_not_found());
+        return Err(unsubscribe_not_found().into());
     };
 
     sqlx::query!(
@@ -665,11 +681,11 @@ async fn logout(
     State(state): State<AppState>,
     Session(session): Session<PrnSession>,
     Form(form): Form<CsrfForm>,
-) -> Result<Redirect, Response> {
+) -> Result<Redirect, RouteError> {
     if session.user_id.is_some() {
         let expected = session.csrf_token.as_deref().unwrap_or_default();
         if !csrf_matches(expected, form.csrf.as_deref().unwrap_or_default()) {
-            return Err(csrf_rejection());
+            return Err(csrf_rejection().into());
         }
         session
             .clear_user(&state.db)
@@ -687,9 +703,9 @@ async fn disconnect(
     user: CurrentUser,
     jar: CookieJar<AppState>,
     Form(form): Form<CsrfForm>,
-) -> Result<Redirect, Response> {
+) -> Result<Redirect, RouteError> {
     if !csrf_matches(&user.csrf_token, form.csrf.as_deref().unwrap_or_default()) {
-        return Err(csrf_rejection());
+        return Err(csrf_rejection().into());
     }
 
     // Revoke with a *fresh* access token where possible — GitHub may not

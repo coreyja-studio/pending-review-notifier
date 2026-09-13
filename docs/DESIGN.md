@@ -102,6 +102,11 @@ mapping table if needed for dashboard auth (see cja `Session` extractor).
 
 ## Jobs & scheduling
 
+Eyes receives the job/cron registry at boot, plus an HTTP monitor for `/healthz`
+resolved against `APP_BASE_URL`. The check covers HTTP availability; background
+work still needs process-role declarations before Eyes run-health alerts are
+armed. Registration remains optional and best effort through cja.
+
 - `SyncUser { user_id }` — refresh token if <5 min to expiry → paginate discovery →
   upsert `pending_reviews` (backlog rule applies at insert only) → update
   `last_seen_at` on all seen rows → reap rows not seen this sweep (delete; a submitted
