@@ -43,14 +43,18 @@ async fn async_main() -> cja::Result<()> {
     // before being handed off to the cron worker.
     let cron_registry = cron::registry();
 
-    // Emit this app's shape (job types, cron schedules, build version) to Eyes
-    // at boot; fire-and-forget and a no-op when EYES_ORG_ID/EYES_APP_ID are
-    // unset. No git SHA is wired into the build, so pass None.
-    cja::eyes_manifest::send_boot_manifest::<jobs::Jobs, AppState>(
+    // The existing public health endpoint also gives Eyes an external check
+    // of this always-on service. Keep boot registration best effort.
+    let manifest = cja::eyes_manifest::build_boot_manifest::<jobs::Jobs, AppState>(
         Some(env!("CARGO_PKG_VERSION")),
         None,
         Some(&cron_registry),
-    );
+    )
+    .base_url(app_state.config.base_url.clone())
+    .monitors(vec![cja::eyes_manifest::HttpMonitor::new(
+        "health", "/healthz",
+    )]);
+    cja::eyes_manifest::send_manifest(manifest);
 
     // Cancelled on SIGINT/SIGTERM; the job and cron workers watch it for
     // graceful shutdown.
