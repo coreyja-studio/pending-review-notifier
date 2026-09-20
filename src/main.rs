@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use cja::{
-    color_eyre::eyre::eyre,
-    jobs::{CancellationToken, DEFAULT_LOCK_TIMEOUT, DEFAULT_MAX_RETRIES, worker::job_worker},
+    jobs::{DEFAULT_LOCK_TIMEOUT, DEFAULT_MAX_RETRIES, worker::job_worker_with_shutdown_drain},
+    server::run_server_until,
     setup::{setup_sentry, setup_tracing},
+    tasks::{ShutdownBudget, Supervisor},
 };
-use tokio::task::JoinError;
 
 mod cron;
 mod crypto;
@@ -18,6 +18,23 @@ mod session;
 mod state;
 
 use state::AppState;
+
+/// Shutdown budget, sized for fly.toml's `kill_signal = "SIGTERM"` +
+/// `kill_timeout = "10s"`: 8s in total, leaving ~2s before SIGKILL for the
+/// process to exit and telemetry to flush.
+///
+/// An in-flight job gets 5s to finish. `SyncUser` and `SendReminder` are a
+/// handful of GitHub/MailPace round trips, so that lets nearly all of them
+/// complete instead of being re-run (a `SendReminder` dropped between the
+/// send and the `notified_at` stamp re-sends the email on retry). Whatever is
+/// still running after 5s is dropped with its lock released, so the next
+/// boot claims it at once rather than after the 2h lock timeout. The
+/// remaining 3s covers that lock release, the cron worker, and the HTTP
+/// server closing its connections.
+const SHUTDOWN_BUDGET: ShutdownBudget = ShutdownBudget {
+    job_drain: Duration::from_secs(5),
+    exit_grace: Duration::from_secs(3),
+};
 
 fn main() -> cja::Result<()> {
     color_eyre::install()?;
@@ -56,111 +73,35 @@ async fn async_main() -> cja::Result<()> {
     )]);
     cja::eyes_manifest::send_manifest(manifest);
 
-    // Cancelled on SIGINT/SIGTERM; the job and cron workers watch it for
-    // graceful shutdown.
-    let shutdown_token = CancellationToken::new();
-    tokio::spawn(cancel_on_shutdown_signal(shutdown_token.clone()));
-
-    let router = routes::routes().with_state(app_state.clone());
+    // The supervisor registers SIGTERM + SIGINT, owns the shutdown token the
+    // server, job worker and cron all watch, and runs the drain.
+    let mut supervisor = Supervisor::new(SHUTDOWN_BUDGET)?;
+    let shutdown = supervisor.shutdown_token();
 
     tracing::info!("Spawning tasks");
-    let mut server = tokio::spawn(cja::server::run_server(router));
-    let mut job = tokio::spawn(job_worker(
-        app_state.clone(),
-        jobs::Jobs,
-        Duration::from_secs(5),
-        DEFAULT_MAX_RETRIES,
-        shutdown_token.clone(),
-        DEFAULT_LOCK_TIMEOUT,
-    ));
-    let mut cron = tokio::spawn(cron::run_cron(
-        app_state.clone(),
-        cron_registry,
-        shutdown_token.clone(),
-    ));
+    supervisor.spawn(
+        "server",
+        run_server_until(
+            routes::routes().with_state(app_state.clone()),
+            shutdown.clone().cancelled_owned(),
+        ),
+    );
+    supervisor.spawn(
+        "job_worker",
+        job_worker_with_shutdown_drain(
+            app_state.clone(),
+            jobs::Jobs,
+            Duration::from_secs(5),
+            DEFAULT_MAX_RETRIES,
+            shutdown.clone(),
+            DEFAULT_LOCK_TIMEOUT,
+            supervisor.budget().job_drain,
+        ),
+    );
+    supervisor.spawn(
+        "cron_worker",
+        cron::run_cron(app_state, cron_registry, shutdown),
+    );
 
-    // Wait for a shutdown signal, or for any task to exit on its own —
-    // these are long-running tasks, so an unprompted exit is an error.
-    tokio::select! {
-        () = shutdown_token.cancelled() => {}
-        result = &mut server => return task_exited("server", result),
-        result = &mut job => return task_exited("job_worker", result),
-        result = &mut cron => return task_exited("cron_worker", result),
-    }
-
-    // Graceful shutdown: the job and cron workers watch the token and run
-    // cleanup after their loops exit (the job worker's cleanup_worker_locks
-    // releases its job locks so an in-flight job doesn't strand until the 2h
-    // lock timeout on every deploy). Wait for them with a deadline that fits
-    // under fly.toml's 10s kill_timeout.
-    tracing::info!("Shutdown requested; waiting for workers to finish cleanup");
-    // run_server doesn't watch the token and never exits on its own.
-    server.abort();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    for (name, handle) in [("job_worker", job), ("cron_worker", cron)] {
-        match tokio::time::timeout_at(deadline, handle).await {
-            Ok(Ok(Ok(()))) => tracing::info!(task = name, "Shut down cleanly"),
-            Ok(Ok(Err(error))) => {
-                tracing::error!(task = name, ?error, "Task errored during shutdown");
-            }
-            Ok(Err(join_error)) => {
-                tracing::error!(task = name, ?join_error, "Task panicked during shutdown");
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    task = name,
-                    "Task did not finish cleanup before the timeout"
-                );
-            }
-        }
-    }
-
-    tracing::info!("Shutdown complete");
-    Ok(())
-}
-
-/// A long-running task exited without a shutdown having been requested;
-/// convert whatever happened into an error so the process restarts.
-fn task_exited(name: &'static str, result: Result<cja::Result<()>, JoinError>) -> cja::Result<()> {
-    match result {
-        Ok(Ok(())) => {
-            tracing::error!(task = name, "Task exited unexpectedly");
-            Err(eyre!("Task '{name}' exited unexpectedly"))
-        }
-        Ok(Err(error)) => {
-            tracing::error!(task = name, ?error, "Task failed");
-            Err(error)
-        }
-        Err(join_error) => {
-            tracing::error!(task = name, ?join_error, "Task panicked");
-            Err(eyre!("Task '{name}' panicked: {join_error}"))
-        }
-    }
-}
-
-async fn cancel_on_shutdown_signal(token: CancellationToken) {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install ctrl-c handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
-    }
-
-    tracing::info!("Shutdown signal received");
-    token.cancel();
+    supervisor.run().await
 }
