@@ -158,7 +158,7 @@ fn parse_args(argv: &[String]) -> Result<Cli> {
                 quiet = true;
             }
             "-h" | "--help" => return Ok(Cli::Help),
-            other => bail!("unknown argument {other:?}"),
+            other => return Err(eyre!("unknown argument {other:?}")),
         }
     }
 

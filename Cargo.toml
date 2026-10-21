@@ -31,7 +31,7 @@ pkg-fmt = "tgz"
 bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
-cja = { git = "https://github.com/coreyja/cja", rev = "a6406d791a81e947d4b6f1854c1bd6db9cfe20b9" }
+cja = { git = "https://github.com/coreyja/cja", rev = "319274e874cbaed79054012453e3922535ff445e" }
 
 tokio = { version = "1.21", features = ["full"] }
 axum = "0.8"
