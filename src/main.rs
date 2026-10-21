@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use cja::{
-    jobs::{DEFAULT_LOCK_TIMEOUT, DEFAULT_MAX_RETRIES, worker::job_worker_with_shutdown_drain},
+    jobs::{DEFAULT_MAX_RETRIES, JobWorkerConfig, worker::job_worker},
     server::run_server_until,
-    setup::{setup_sentry, setup_tracing},
+    setup::setup_tracing,
     tasks::{ShutdownBudget, Supervisor},
 };
 
@@ -40,7 +40,6 @@ fn main() -> cja::Result<()> {
     color_eyre::install()?;
 
     // Sentry must be initialized before the tokio runtime starts.
-    let _sentry_guard = setup_sentry();
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -88,14 +87,16 @@ async fn async_main() -> cja::Result<()> {
     );
     supervisor.spawn(
         "job_worker",
-        job_worker_with_shutdown_drain(
+        job_worker(
             app_state.clone(),
             jobs::Jobs,
             Duration::from_secs(5),
             DEFAULT_MAX_RETRIES,
             shutdown.clone(),
-            DEFAULT_LOCK_TIMEOUT,
-            supervisor.budget().job_drain,
+            JobWorkerConfig {
+                shutdown_drain_timeout: supervisor.budget().job_drain,
+                ..JobWorkerConfig::default()
+            },
         ),
     );
     supervisor.spawn(
