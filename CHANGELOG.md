@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/coreyja-studio/pending-review-notifier/compare/v0.2.1...v0.3.0) (2026-10-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* cja 319274e (drop Sentry + OpenTelemetry), rustls-webpki 0.103.16 ([#23](https://github.com/coreyja-studio/pending-review-notifier/issues/23))
+
+### Features
+
+* cja 319274e (drop Sentry + OpenTelemetry), rustls-webpki 0.103.16 ([#23](https://github.com/coreyja-studio/pending-review-notifier/issues/23)) ([e8bd1a0](https://github.com/coreyja-studio/pending-review-notifier/commit/e8bd1a08d6fc66ee3b49b04dbffbb1f6730c60a4))
+* declare Eyes health check for the notifier ([#21](https://github.com/coreyja-studio/pending-review-notifier/issues/21)) ([a585742](https://github.com/coreyja-studio/pending-review-notifier/commit/a5857422ea26436f34a2bee691758d9461e9b7a7))
+* emit Eyes boot manifest at startup ([#19](https://github.com/coreyja-studio/pending-review-notifier/issues/19)) ([7c843fa](https://github.com/coreyja-studio/pending-review-notifier/commit/7c843fa4d79800c8d62c2900df30dbc30f9cb88b))
+
+
+### Bug Fixes
+
+* graceful shutdown via cja's Supervisor (DEV-1334) ([#22](https://github.com/coreyja-studio/pending-review-notifier/issues/22)) ([77bb9a9](https://github.com/coreyja-studio/pending-review-notifier/commit/77bb9a95d132f7c0bb02fbfe5e0cccbff9617492))
+* keep eyes shutdown handle alive so eyes telemetry works ([#15](https://github.com/coreyja-studio/pending-review-notifier/issues/15)) ([72bfd19](https://github.com/coreyja-studio/pending-review-notifier/commit/72bfd19757ea4f2165830b83e44c4b73144b56fa))
+
 ## [0.2.1](https://github.com/coreyja-studio/pending-review-notifier/compare/v0.2.0...v0.2.1) (2026-07-17)
 
 
