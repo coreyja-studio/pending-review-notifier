@@ -220,3 +220,25 @@ impl FromRequestParts<AppState> for CurrentUser {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test]
+    async fn missing_session_is_none_and_database_errors_propagate(pool: PgPool) {
+        let missing = Uuid::new_v4();
+        assert!(PrnSession::from_db(&pool, missing).await.unwrap().is_none());
+
+        let created = PrnSession::create(&pool).await.unwrap();
+        let loaded = PrnSession::from_db(&pool, *created.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded.user_id.is_none());
+        assert!(loaded.signed_in_at.is_none());
+
+        pool.close().await;
+        assert!(PrnSession::from_db(&pool, missing).await.is_err());
+    }
+}
