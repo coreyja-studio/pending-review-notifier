@@ -397,14 +397,16 @@ fn print_items(items: &[ReportItem], now: Timestamp) {
 /// reminder email formatting.
 fn format_age(last_comment_at: Timestamp, now: Timestamp) -> String {
     let elapsed = now - last_comment_at;
-    if (elapsed.as_secs() / 86_400) >= 7 {
-        format!("{}w", (elapsed.as_secs() / 86_400) / 7)
-    } else if (elapsed.as_secs() / 86_400) > 0 {
-        format!("{}d", (elapsed.as_secs() / 86_400))
-    } else if (elapsed.as_secs() / 3_600) > 0 {
-        format!("{}h", (elapsed.as_secs() / 3_600))
+    let seconds = elapsed.as_secs();
+    let days = seconds / 86_400;
+    if days >= 7 {
+        format!("{}w", days / 7)
+    } else if days > 0 {
+        format!("{days}d")
+    } else if seconds / 3_600 > 0 {
+        format!("{}h", seconds / 3_600)
     } else {
-        format!("{}m", (elapsed.as_secs() / 60).max(0))
+        format!("{}m", (seconds / 60).max(0))
     }
 }
 

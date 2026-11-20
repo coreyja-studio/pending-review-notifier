@@ -66,15 +66,9 @@ async fn run_tasks() -> cja::Result<()> {
     // before being handed off to the cron worker.
     let cron_registry = cron::registry();
 
-    // The existing public health endpoint also gives Eyes an external check
-    // of this always-on service. Keep Eyes transport best effort.
-    let manifest = cja::eyes_manifest::build_boot_manifest_from_state::<jobs::Jobs, AppState>(
-        &app_state,
-        Some(env!("CARGO_PKG_VERSION")),
-        None,
-        Some(&cron_registry),
-    )?;
-    cja::eyes_manifest::send_manifest(manifest);
+    // Eyes is optional. A local APP_BASE_URL cannot be used for an external
+    // HTTP check, but the job and cron declarations are still useful.
+    cja::eyes_manifest::send_manifest(eyes_boot_manifest(&app_state, &cron_registry));
 
     cja::posthog_manifest::emit_boot_manifest::<jobs::Jobs, AppState>(
         &app_state,
@@ -114,4 +108,54 @@ async fn run_tasks() -> cja::Result<()> {
     );
 
     supervisor.run().await
+}
+
+fn eyes_boot_manifest(
+    state: &AppState,
+    cron_registry: &cja::cron::CronRegistry<AppState>,
+) -> cja::eyes_manifest::AppManifest {
+    match cja::eyes_manifest::build_boot_manifest_from_state::<jobs::Jobs, AppState>(
+        state,
+        Some(env!("CARGO_PKG_VERSION")),
+        None,
+        Some(cron_registry),
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            tracing::warn!(%error, "Eyes HTTP monitor declaration unavailable; sending jobs and crons");
+            cja::eyes_manifest::build_boot_manifest::<jobs::Jobs, AppState>(
+                Some(env!("CARGO_PKG_VERSION")),
+                None,
+                Some(cron_registry),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn eyes_manifest_falls_back_for_localhost_and_keeps_public_health_monitor() {
+        let mut state = state::test_support::lazy_test_state();
+        let registry = cron::registry();
+
+        state.config.base_url = "http://localhost:3000".to_string();
+        let local = eyes_boot_manifest(&state, &registry);
+        assert_eq!(local.base_url, None);
+        assert_eq!(local.monitors, None);
+        assert_eq!(local.jobs.len(), 2);
+        assert_eq!(local.crons.len(), 2);
+
+        state.config.base_url = "https://prn.test".to_string();
+        let public = eyes_boot_manifest(&state, &registry);
+        assert_eq!(public.base_url.as_deref(), Some("https://prn.test"));
+        let monitors = public.monitors.expect("public URL should keep its monitor");
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[0].id, "health");
+        assert_eq!(monitors[0].target, "https://prn.test/healthz");
+        assert_eq!(public.jobs, local.jobs);
+        assert_eq!(public.crons.len(), local.crons.len());
+    }
 }

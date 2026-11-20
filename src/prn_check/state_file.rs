@@ -183,7 +183,7 @@ pub fn apply_sweep(
             // Same three-way disjunction as the service: never alerted, a
             // comment landed after the last alert (new cycle), or the last
             // alert is past the re-nudge window.
-            at < entry.last_comment_at || at < now - Duration::from_hours((NOTIFY_DEDUP_DAYS) * 24)
+            at < entry.last_comment_at || at < now - Duration::from_hours(NOTIFY_DEDUP_DAYS * 24)
         }) {
             entry.notified_at = Some(now);
             outcome.newly_actionable.push(item);
