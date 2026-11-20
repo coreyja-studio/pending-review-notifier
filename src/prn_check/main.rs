@@ -480,12 +480,56 @@ mod tests {
     #[test]
     fn json_output_keeps_keys_and_serializes_fractional_instants() {
         let now = "2026-07-15T12:00:00.240100Z".parse::<Timestamp>().unwrap();
-        let json = json_output(&SweepOutcome::default(), "coreyja", 4, now).unwrap();
+        let outcome = SweepOutcome {
+            newly_actionable: vec![ReportItem {
+                review_id: "actionable-review".to_string(),
+                pr_url: "https://github.com/o/r/pull/1".to_string(),
+                pr_title: "Actionable PR".to_string(),
+                repo_name_with_owner: "o/r".to_string(),
+                comment_count: 2,
+                last_comment_at: "2026-07-15T07:00:00.240100Z".parse().unwrap(),
+                first_seen_at: "2026-07-14T12:00:00Z".parse().unwrap(),
+            }],
+            backlog: vec![ReportItem {
+                review_id: "backlog-review".to_string(),
+                pr_url: "https://github.com/o/r/pull/2".to_string(),
+                pr_title: "Backlog PR".to_string(),
+                repo_name_with_owner: "o/r".to_string(),
+                comment_count: 3,
+                last_comment_at: "2026-07-10T09:00:00Z".parse().unwrap(),
+                first_seen_at: "2026-07-15T11:00:00Z".parse().unwrap(),
+            }],
+            ..SweepOutcome::default()
+        };
+        let json = json_output(&outcome, "coreyja", 4, now).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["checked_at"], "2026-07-15T12:00:00.2401Z");
-        assert_eq!(value["login"], "coreyja");
-        assert_eq!(value["threshold_hours"], 4);
-        assert!(value.get("newly_actionable").is_some());
-        assert!(value.get("backlog").is_some());
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "checked_at": "2026-07-15T12:00:00.2401Z",
+                "login": "coreyja",
+                "threshold_hours": 4,
+                "newly_actionable": [{
+                    "review_id": "actionable-review",
+                    "pr_url": "https://github.com/o/r/pull/1",
+                    "pr_title": "Actionable PR",
+                    "repo_name_with_owner": "o/r",
+                    "comment_count": 2,
+                    "last_comment_at": "2026-07-15T07:00:00.2401Z",
+                    "first_seen_at": "2026-07-14T12:00:00Z"
+                }],
+                "snoozed": [],
+                "backlog": [{
+                    "review_id": "backlog-review",
+                    "pr_url": "https://github.com/o/r/pull/2",
+                    "pr_title": "Backlog PR",
+                    "repo_name_with_owner": "o/r",
+                    "comment_count": 3,
+                    "last_comment_at": "2026-07-10T09:00:00Z",
+                    "first_seen_at": "2026-07-15T11:00:00Z"
+                }],
+                "fresh": []
+            })
+        );
     }
 }
