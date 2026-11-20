@@ -17,8 +17,7 @@ const REMINDER_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Build the cron registry.
 ///
-/// The closures are deliberately infallible (`Result<(), Infallible>`): a cron
-/// closure that returns `Err` propagates up and crashes the whole app, so
+/// The closures are deliberately infallible (`Result<(), Infallible>`):
 /// [`sync_sweep`] and [`reminder_sweep`] handle every error internally
 /// (log-and-continue) and the wrappers can only ever return `Ok`.
 ///
@@ -125,7 +124,7 @@ pub async fn run_cron(
         Duration::from_secs(60),
     )
     .run(shutdown_token)
-    .await?;
+    .await;
 
     Ok(())
 }

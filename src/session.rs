@@ -34,7 +34,7 @@ pub struct PrnSession {
 
 #[async_trait::async_trait]
 impl AppSession for PrnSession {
-    async fn from_db(pool: &PgPool, session_id: Uuid) -> cja::Result<Self> {
+    async fn from_db(pool: &PgPool, session_id: Uuid) -> cja::Result<Option<Self>> {
         let row = sqlx::query!(
             r#"
             SELECT s.session_id, s.created_at, s.updated_at,
@@ -47,10 +47,10 @@ impl AppSession for PrnSession {
             "#,
             session_id
         )
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(Self {
+        Ok(row.map(|row| Self {
             inner: CJASession {
                 session_id: row.session_id,
                 updated_at: row.updated_at,
@@ -59,7 +59,7 @@ impl AppSession for PrnSession {
             user_id: row.user_id,
             csrf_token: row.csrf_token,
             signed_in_at: row.signed_in_at,
-        })
+        }))
     }
 
     async fn create(pool: &PgPool) -> cja::Result<Self> {
