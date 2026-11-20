@@ -5,6 +5,8 @@
 //! signed-in session; no row means anonymous). The mapping row also carries
 //! the per-session CSRF token and the sign-in timestamp used for expiry.
 
+use jiff::Timestamp;
+
 use axum::{
     extract::FromRequestParts,
     http::StatusCode,
@@ -29,7 +31,7 @@ pub struct PrnSession {
     pub csrf_token: Option<Vec<u8>>,
     /// When the user signed in (user_sessions.created_at); present iff
     /// `user_id` is.
-    pub signed_in_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub signed_in_at: Option<Timestamp>,
 }
 
 #[async_trait::async_trait]
@@ -53,12 +55,12 @@ impl AppSession for PrnSession {
         Ok(row.map(|row| Self {
             inner: CJASession {
                 session_id: row.session_id,
-                updated_at: row.updated_at,
-                created_at: row.created_at,
+                updated_at: row.updated_at.into(),
+                created_at: row.created_at.into(),
             },
             user_id: row.user_id,
             csrf_token: row.csrf_token,
-            signed_in_at: row.signed_in_at,
+            signed_in_at: row.signed_in_at.map(Into::into),
         }))
     }
 
@@ -188,7 +190,9 @@ impl FromRequestParts<AppState> for CurrentUser {
         };
 
         // Expire (and reap) old sign-ins rather than letting them live forever.
-        if signed_in_at < chrono::Utc::now() - chrono::Duration::days(SESSION_MAX_AGE_DAYS) {
+        if signed_in_at
+            < Timestamp::now() - jiff::SignedDuration::from_hours(SESSION_MAX_AGE_DAYS * 24)
+        {
             if let Err(err) = session.clear_user(&state.db).await {
                 tracing::error!(?err, "Failed to reap an expired session mapping");
             }

@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "notified_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "pending_reviews",
+            "name": "notified_at"
+          }
+        }
       }
     ],
     "parameters": {

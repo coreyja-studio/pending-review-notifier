@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
+use jiff::Timestamp;
 
 // Linked straight from the service source tree (not moved, per the
 // architectural rule in src/discovery.rs: the discovery core is DB-free
@@ -247,7 +247,7 @@ async fn run(args: &Args) -> Result<bool> {
     let mut state = state_file::load(&args.state_file)?;
     let discovered = discovery::discover_pending_reviews(&http, &api_base, &token, &login).await?;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let outcome = state_file::apply_sweep(&mut state, &discovered, args.threshold_hours, now);
 
     if args.json {
@@ -302,11 +302,21 @@ fn print_json(
     outcome: &SweepOutcome,
     login: &str,
     threshold_hours: i32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<()> {
+    println!("{}", json_output(outcome, login, threshold_hours, now)?);
+    Ok(())
+}
+
+fn json_output(
+    outcome: &SweepOutcome,
+    login: &str,
+    threshold_hours: i32,
+    now: Timestamp,
+) -> Result<String> {
     #[derive(serde::Serialize)]
     struct JsonOutput<'a> {
-        checked_at: DateTime<Utc>,
+        checked_at: Timestamp,
         login: &'a str,
         threshold_hours: i32,
         #[serde(flatten)]
@@ -319,11 +329,10 @@ fn print_json(
         threshold_hours,
         outcome,
     };
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
+    Ok(serde_json::to_string_pretty(&output)?)
 }
 
-fn print_human(outcome: &SweepOutcome, threshold_hours: i32, quiet: bool, now: DateTime<Utc>) {
+fn print_human(outcome: &SweepOutcome, threshold_hours: i32, quiet: bool, now: Timestamp) {
     if outcome.newly_actionable.is_empty() {
         if !quiet {
             println!("No newly actionable pending reviews.");
@@ -367,7 +376,7 @@ fn print_human(outcome: &SweepOutcome, threshold_hours: i32, quiet: bool, now: D
     }
 }
 
-fn print_items(items: &[ReportItem], now: DateTime<Utc>) {
+fn print_items(items: &[ReportItem], now: Timestamp) {
     for item in items {
         let comments = if item.comment_count == 1 {
             "1 comment".to_string()
@@ -386,16 +395,16 @@ fn print_items(items: &[ReportItem], now: DateTime<Utc>) {
 
 /// Human-readable age (e.g. "3d", "2w", "5h", "12m"), matching the service's
 /// reminder email formatting.
-fn format_age(last_comment_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+fn format_age(last_comment_at: Timestamp, now: Timestamp) -> String {
     let elapsed = now - last_comment_at;
-    if elapsed.num_days() >= 7 {
-        format!("{}w", elapsed.num_days() / 7)
-    } else if elapsed.num_days() > 0 {
-        format!("{}d", elapsed.num_days())
-    } else if elapsed.num_hours() > 0 {
-        format!("{}h", elapsed.num_hours())
+    if (elapsed.as_secs() / 86_400) >= 7 {
+        format!("{}w", (elapsed.as_secs() / 86_400) / 7)
+    } else if (elapsed.as_secs() / 86_400) > 0 {
+        format!("{}d", (elapsed.as_secs() / 86_400))
+    } else if (elapsed.as_secs() / 3_600) > 0 {
+        format!("{}h", (elapsed.as_secs() / 3_600))
     } else {
-        format!("{}m", elapsed.num_minutes().max(0))
+        format!("{}m", (elapsed.as_secs() / 60).max(0))
     }
 }
 
@@ -458,13 +467,23 @@ mod tests {
 
     #[test]
     fn format_age_matches_the_reminder_email_style() {
-        let now = DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let now = "2026-07-15T12:00:00Z".parse::<Timestamp>().unwrap();
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
         assert_eq!(format_age(at("2026-07-01T12:00:00Z"), now), "2w");
         assert_eq!(format_age(at("2026-07-12T12:00:00Z"), now), "3d");
         assert_eq!(format_age(at("2026-07-15T07:00:00Z"), now), "5h");
         assert_eq!(format_age(at("2026-07-15T11:48:00Z"), now), "12m");
+    }
+
+    #[test]
+    fn json_output_keeps_keys_and_serializes_fractional_instants() {
+        let now = "2026-07-15T12:00:00.240100Z".parse::<Timestamp>().unwrap();
+        let json = json_output(&SweepOutcome::default(), "coreyja", 4, now).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["checked_at"], "2026-07-15T12:00:00.2401Z");
+        assert_eq!(value["login"], "coreyja");
+        assert_eq!(value["threshold_hours"], 4);
+        assert!(value.get("newly_actionable").is_some());
+        assert!(value.get("backlog").is_some());
     }
 }

@@ -1,5 +1,5 @@
-use chrono::Utc;
 use cja::jobs::Job;
+use jiff::Timestamp;
 use maud::{DOCTYPE, html};
 use uuid::Uuid;
 
@@ -62,7 +62,7 @@ impl Job<AppState> for SyncUser {
         // One timestamp for the whole sweep: every upserted row is stamped with
         // it, and anything left older than it (i.e. not seen this pass) is
         // reaped. Capturing it once avoids a row straddling the boundary.
-        let sweep_at = Utc::now();
+        let sweep_at = Timestamp::now();
 
         for review in &reviews {
             let stale_now =
@@ -92,8 +92,8 @@ impl Job<AppState> for SyncUser {
                 review.pr_title,
                 review.repo_name_with_owner,
                 review.comment_count,
-                review.last_comment_at,
-                sweep_at,
+                cja::jiff_sqlx::Timestamp::from(review.last_comment_at),
+                cja::jiff_sqlx::Timestamp::from(sweep_at),
                 is_backlog,
             )
             .execute(&state.db)
@@ -105,7 +105,7 @@ impl Job<AppState> for SyncUser {
         let reaped = sqlx::query!(
             "DELETE FROM pending_reviews WHERE user_id = $1 AND last_seen_at < $2",
             self.user_id,
-            sweep_at
+            cja::jiff_sqlx::Timestamp::from(sweep_at)
         )
         .execute(&state.db)
         .await?
@@ -137,7 +137,7 @@ struct ReminderReviewRow {
     repo_name_with_owner: String,
     pr_url: String,
     comment_count: i32,
-    last_comment_at: chrono::DateTime<chrono::Utc>,
+    last_comment_at: Timestamp,
 }
 
 /// Send a reminder email for a user's email-eligible pending reviews.
@@ -259,16 +259,16 @@ impl Job<AppState> for SendReminder {
 }
 
 /// Human-readable age from `last_comment_at` to now (e.g. "3d", "2w", "5h", "12m").
-fn format_age(last_comment_at: chrono::DateTime<chrono::Utc>) -> String {
-    let elapsed = chrono::Utc::now() - last_comment_at;
-    if elapsed.num_days() >= 7 {
-        format!("{}w", elapsed.num_days() / 7)
-    } else if elapsed.num_days() > 0 {
-        format!("{}d", elapsed.num_days())
-    } else if elapsed.num_hours() > 0 {
-        format!("{}h", elapsed.num_hours())
+fn format_age(last_comment_at: Timestamp) -> String {
+    let elapsed = Timestamp::now() - last_comment_at;
+    if (elapsed.as_secs() / 86_400) >= 7 {
+        format!("{}w", (elapsed.as_secs() / 86_400) / 7)
+    } else if (elapsed.as_secs() / 86_400) > 0 {
+        format!("{}d", (elapsed.as_secs() / 86_400))
+    } else if (elapsed.as_secs() / 3_600) > 0 {
+        format!("{}h", (elapsed.as_secs() / 3_600))
     } else {
-        format!("{}m", elapsed.num_minutes().max(0))
+        format!("{}m", (elapsed.as_secs() / 60).max(0))
     }
 }
 
@@ -387,7 +387,7 @@ fn render_reminder_email(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Duration, Utc};
+    use jiff::{SignedDuration as Duration, Timestamp};
     use sqlx::PgPool;
     use std::sync::Arc;
     use wiremock::{
@@ -417,7 +417,7 @@ mod tests {
                 .crypto
                 .encrypt("ghr_refresh", user_id.as_bytes())
                 .unwrap(),
-            Utc::now() + Duration::days(30),
+            cja::jiff_sqlx::Timestamp::from(Timestamp::now() + Duration::from_hours(30 * 24)),
             threshold_hours,
         )
         .execute(&state.db)
@@ -443,14 +443,9 @@ mod tests {
             .await;
     }
 
-    fn pr_node(
-        url: &str,
-        review_id: &str,
-        comment_at: DateTime<Utc>,
-        total: i32,
-    ) -> serde_json::Value {
+    fn pr_node(url: &str, review_id: &str, comment_at: Timestamp, total: i32) -> serde_json::Value {
         let comment_nodes = if total > 0 {
-            serde_json::json!([{ "createdAt": comment_at.to_rfc3339() }])
+            serde_json::json!([{ "createdAt": comment_at.to_string() }])
         } else {
             serde_json::json!([])
         };
@@ -461,7 +456,7 @@ mod tests {
             "repository": { "nameWithOwner": "o/r" },
             "reviews": { "nodes": [{
                 "id": review_id,
-                "createdAt": comment_at.to_rfc3339(),
+                "createdAt": comment_at.to_string(),
                 "comments": { "totalCount": total, "nodes": comment_nodes }
             }]}
         })
@@ -481,14 +476,19 @@ mod tests {
 
         // One stale review (10h old > 4h threshold → backlog), one fresh review
         // (1h old → email-eligible), one empty shell (skipped).
-        let stale_at = Utc::now() - Duration::hours(10);
-        let fresh_at = Utc::now() - Duration::hours(1);
+        let stale_at = Timestamp::now() - Duration::from_hours(10);
+        let fresh_at = Timestamp::now() - Duration::from_hours(1);
         mount_search(
             &mock,
             serde_json::json!([
                 pr_node("https://github.com/o/r/pull/1", "R_STALE", stale_at, 2),
                 pr_node("https://github.com/o/r/pull/2", "R_FRESH", fresh_at, 1),
-                pr_node("https://github.com/o/r/pull/3", "R_EMPTY", Utc::now(), 0),
+                pr_node(
+                    "https://github.com/o/r/pull/3",
+                    "R_EMPTY",
+                    Timestamp::now(),
+                    0
+                ),
             ]),
         )
         .await;
@@ -521,7 +521,7 @@ mod tests {
             serde_json::json!([pr_node(
                 "https://github.com/o/r/pull/1",
                 "R1",
-                Utc::now() - Duration::hours(10),
+                Timestamp::now() - Duration::from_hours(10),
                 1
             )]),
         )
@@ -544,7 +544,7 @@ mod tests {
             serde_json::json!([pr_node(
                 "https://github.com/o/r/pull/1",
                 "R1",
-                Utc::now() - Duration::minutes(5),
+                Timestamp::now() - Duration::from_mins(5),
                 2
             )]),
         )
@@ -570,13 +570,13 @@ mod tests {
                 pr_node(
                     "https://github.com/o/r/pull/1",
                     "R1",
-                    Utc::now() - Duration::hours(1),
+                    Timestamp::now() - Duration::from_hours(1),
                     1
                 ),
                 pr_node(
                     "https://github.com/o/r/pull/2",
                     "R2",
-                    Utc::now() - Duration::hours(1),
+                    Timestamp::now() - Duration::from_hours(1),
                     1
                 ),
             ]),
@@ -603,7 +603,7 @@ mod tests {
             serde_json::json!([pr_node(
                 "https://github.com/o/r/pull/1",
                 "R1",
-                Utc::now() - Duration::hours(1),
+                Timestamp::now() - Duration::from_hours(1),
                 1
             )]),
         )
@@ -634,7 +634,7 @@ mod tests {
             user_id,
             state.crypto.encrypt("tok", user_id.as_bytes()).unwrap(),
             state.crypto.encrypt("ref", user_id.as_bytes()).unwrap(),
-            Utc::now() + Duration::days(30),
+            cja::jiff_sqlx::Timestamp::from(Timestamp::now() + Duration::from_hours(30 * 24)),
             threshold_hours,
         )
         .execute(db)
@@ -649,10 +649,10 @@ mod tests {
         user_id: Uuid,
         review_id: &str,
         pr_title: &str,
-        last_comment_at: chrono::DateTime<Utc>,
+        last_comment_at: Timestamp,
         is_backlog: bool,
-        dismissed_at: Option<chrono::DateTime<Utc>>,
-        notified_at: Option<chrono::DateTime<Utc>>,
+        dismissed_at: Option<Timestamp>,
+        notified_at: Option<Timestamp>,
     ) -> Uuid {
         let row = sqlx::query!(
             "INSERT INTO pending_reviews (
@@ -668,11 +668,11 @@ mod tests {
             pr_title,
             "o/r",
             1,
-            last_comment_at,
-            Utc::now(),
+            cja::jiff_sqlx::Timestamp::from(last_comment_at),
+            cja::jiff_sqlx::Timestamp::from(Timestamp::now()),
             is_backlog,
-            dismissed_at,
-            notified_at,
+            dismissed_at.map(cja::jiff_sqlx::Timestamp::from),
+            notified_at.map(cja::jiff_sqlx::Timestamp::from),
         )
         .fetch_one(db)
         .await
@@ -696,7 +696,7 @@ mod tests {
             user_id,
             "R1",
             "Stale PR",
-            Utc::now() - Duration::hours(5),
+            Timestamp::now() - Duration::from_hours(5),
             false,
             None,
             None,
@@ -708,7 +708,7 @@ mod tests {
             user_id,
             "R2",
             "Fresh PR",
-            Utc::now() - Duration::hours(1),
+            Timestamp::now() - Duration::from_hours(1),
             false,
             None,
             None,
@@ -726,13 +726,13 @@ mod tests {
         }
 
         // notified_at stamped on eligible row only
-        let notified: Option<chrono::DateTime<Utc>> =
+        let notified: Option<cja::jiff_sqlx::Timestamp> =
             sqlx::query_scalar!("SELECT notified_at FROM pending_reviews WHERE review_id = 'R1'")
                 .fetch_one(&db)
                 .await
                 .unwrap();
         assert!(notified.is_some());
-        let notified_r2: Option<chrono::DateTime<Utc>> =
+        let notified_r2: Option<cja::jiff_sqlx::Timestamp> =
             sqlx::query_scalar!("SELECT notified_at FROM pending_reviews WHERE review_id = 'R2'")
                 .fetch_one(&db)
                 .await
@@ -758,7 +758,7 @@ mod tests {
             user_id,
             "R1",
             "Crossed between ticks",
-            Utc::now() - Duration::hours(4),
+            Timestamp::now() - Duration::from_hours(4),
             false,
             None,
             None,
@@ -789,7 +789,7 @@ mod tests {
             user_id,
             "R_AT",
             "At threshold",
-            Utc::now() - Duration::hours(4) + Duration::seconds(1),
+            Timestamp::now() - Duration::from_hours(4) + Duration::from_secs(1),
             false,
             None,
             None,
@@ -801,7 +801,7 @@ mod tests {
             user_id,
             "R_PAST",
             "Past threshold",
-            Utc::now() - Duration::hours(4) - Duration::seconds(1),
+            Timestamp::now() - Duration::from_hours(4) - Duration::from_secs(1),
             false,
             None,
             None,
@@ -833,10 +833,10 @@ mod tests {
             user_id,
             "R_RECENT",
             "Recently notified",
-            Utc::now() - Duration::days(10),
+            Timestamp::now() - Duration::from_hours((10) * 24),
             false,
             None,
-            Some(Utc::now() - Duration::days(3)),
+            Some(Timestamp::now() - Duration::from_hours((3) * 24)),
         )
         .await;
         // Reminded 8 days ago, no comment since → past the 7-day window → the
@@ -846,10 +846,10 @@ mod tests {
             user_id,
             "R_OLD",
             "Old notification",
-            Utc::now() - Duration::days(10),
+            Timestamp::now() - Duration::from_hours((10) * 24),
             false,
             None,
-            Some(Utc::now() - Duration::days(8)),
+            Some(Timestamp::now() - Duration::from_hours((8) * 24)),
         )
         .await;
 
@@ -877,7 +877,7 @@ mod tests {
             user_id,
             "R1",
             "Neglected twice",
-            Utc::now() - Duration::hours(4),
+            Timestamp::now() - Duration::from_hours(4),
             false,
             None,
             None,
@@ -914,12 +914,14 @@ mod tests {
         }
 
         // And the stamp was refreshed, closing the new cycle.
-        let notified: Option<chrono::DateTime<Utc>> =
+        let notified: Option<cja::jiff_sqlx::Timestamp> =
             sqlx::query_scalar!("SELECT notified_at FROM pending_reviews WHERE review_id = 'R1'")
                 .fetch_one(&db)
                 .await
                 .unwrap();
-        assert!(notified.unwrap() > Utc::now() - Duration::minutes(1));
+        assert!(
+            jiff::Timestamp::from(notified.unwrap()) > Timestamp::now() - Duration::from_mins(1)
+        );
     }
 
     #[sqlx::test]
@@ -940,10 +942,10 @@ mod tests {
             user_id,
             "R1",
             "Still the same neglect",
-            Utc::now() - Duration::days(5),
+            Timestamp::now() - Duration::from_hours((5) * 24),
             false,
             None,
-            Some(Utc::now() - Duration::days(2)),
+            Some(Timestamp::now() - Duration::from_hours((2) * 24)),
         )
         .await;
 
@@ -969,7 +971,7 @@ mod tests {
             user_id,
             "R_BACK",
             "Backlog",
-            Utc::now() - Duration::hours(10),
+            Timestamp::now() - Duration::from_hours(10),
             true,
             None,
             None,
@@ -981,9 +983,9 @@ mod tests {
             user_id,
             "R_DISM",
             "Dismissed",
-            Utc::now() - Duration::hours(10),
+            Timestamp::now() - Duration::from_hours(10),
             false,
-            Some(Utc::now()),
+            Some(Timestamp::now()),
             None,
         )
         .await;
@@ -993,7 +995,7 @@ mod tests {
             user_id,
             "R_OK",
             "OK",
-            Utc::now() - Duration::hours(10),
+            Timestamp::now() - Duration::from_hours(10),
             false,
             None,
             None,
@@ -1025,7 +1027,7 @@ mod tests {
                 user_id,
                 &format!("R{}", i),
                 &format!("PR {}", i),
-                Utc::now() - Duration::hours(5),
+                Timestamp::now() - Duration::from_hours(5),
                 false,
                 None,
                 None,
@@ -1070,7 +1072,7 @@ mod tests {
             user_id,
             "R1",
             "Fresh",
-            Utc::now() - Duration::hours(1),
+            Timestamp::now() - Duration::from_hours(1),
             false,
             None,
             None,
@@ -1105,7 +1107,7 @@ mod tests {
             user_id,
             "R1",
             "Stale",
-            Utc::now() - Duration::hours(10),
+            Timestamp::now() - Duration::from_hours(10),
             false,
             None,
             None,
@@ -1141,7 +1143,7 @@ mod tests {
             user_id,
             "R1",
             "Stale while paused",
-            Utc::now() - Duration::hours(10),
+            Timestamp::now() - Duration::from_hours(10),
             false,
             None,
             None,
@@ -1189,7 +1191,7 @@ mod tests {
             user_id,
             "R1",
             "Stale PR",
-            Utc::now() - Duration::hours(5),
+            Timestamp::now() - Duration::from_hours(5),
             false,
             None,
             None,

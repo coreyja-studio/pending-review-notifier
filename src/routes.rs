@@ -5,12 +5,11 @@ use axum::{
     response::{IntoResponse as _, Redirect, Response},
     routing::{get, post},
 };
+use jiff::Timestamp;
+
 use cja::{
     app_state::AppState as _,
-    server::{
-        cookies::{Cookie, CookieJar},
-        session::Session,
-    },
+    server::{cookies::CookieJar, session::Session},
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde::Deserialize;
@@ -175,16 +174,16 @@ async fn landing() -> Markup {
 }
 
 /// Human-readable age from `last_comment_at` to now (e.g. "3d", "2w", "5h", "12m").
-fn format_age(last_comment_at: chrono::DateTime<chrono::Utc>) -> String {
-    let elapsed = chrono::Utc::now() - last_comment_at;
-    if elapsed.num_days() >= 7 {
-        format!("{}w", elapsed.num_days() / 7)
-    } else if elapsed.num_days() > 0 {
-        format!("{}d", elapsed.num_days())
-    } else if elapsed.num_hours() > 0 {
-        format!("{}h", elapsed.num_hours())
+fn format_age(last_comment_at: Timestamp) -> String {
+    let elapsed = Timestamp::now() - last_comment_at;
+    if (elapsed.as_secs() / 86_400) >= 7 {
+        format!("{}w", (elapsed.as_secs() / 86_400) / 7)
+    } else if (elapsed.as_secs() / 86_400) > 0 {
+        format!("{}d", (elapsed.as_secs() / 86_400))
+    } else if (elapsed.as_secs() / 3_600) > 0 {
+        format!("{}h", (elapsed.as_secs() / 3_600))
     } else {
-        format!("{}m", elapsed.num_minutes().max(0))
+        format!("{}m", (elapsed.as_secs() / 60).max(0))
     }
 }
 
@@ -261,7 +260,7 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
                                                         " · " (review.comment_count)
                                                         @if review.comment_count == 1 { " comment" } @else { " comments" }
                                                         " · "
-                                                        span class="age-hot" { (format_age(review.last_comment_at)) }
+                                                        span class="age-hot" { (format_age(review.last_comment_at.into())) }
                                                         " since last comment"
                                                     }
                                                 }
@@ -292,7 +291,7 @@ async fn dashboard(State(state): State<AppState>, user: CurrentUser) -> Result<M
                                                         (review.repo_name_with_owner)
                                                         " · " (review.comment_count)
                                                         @if review.comment_count == 1 { " comment" } @else { " comments" }
-                                                        " · " (format_age(review.last_comment_at))
+                                                        " · " (format_age(review.last_comment_at.into()))
                                                         " since last comment"
                                                     }
                                                 }
@@ -761,7 +760,7 @@ async fn disconnect(
         .destroy(&state.db)
         .await
         .map_err(internal_error)?;
-    jar.remove(Cookie::build(("session_id", "")).path("/").build());
+    cja::server::session::clear_session_cookie(&jar);
 
     Ok(Redirect::to("/"))
 }
@@ -772,7 +771,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode, header},
     };
-    use chrono::{Duration, Utc};
+    use jiff::{SignedDuration as Duration, Timestamp};
     use sqlx::PgPool;
     use tower::ServiceExt as _;
     use wiremock::{
@@ -1008,7 +1007,7 @@ mod tests {
         pr_title: &str,
         repo: &str,
         comment_count: i32,
-        last_comment_at: chrono::DateTime<chrono::Utc>,
+        last_comment_at: Timestamp,
         is_backlog: bool,
     ) -> Uuid {
         let row = sqlx::query!(
@@ -1024,8 +1023,8 @@ mod tests {
             pr_title,
             repo,
             comment_count,
-            last_comment_at,
-            Utc::now(),
+            cja::jiff_sqlx::Timestamp::from(last_comment_at),
+            cja::jiff_sqlx::Timestamp::from(Timestamp::now()),
             is_backlog,
         )
         .fetch_one(db)
@@ -1057,7 +1056,7 @@ mod tests {
             "Fix the bug",
             "o/r",
             2,
-            Utc::now() - Duration::hours(5),
+            Timestamp::now() - Duration::from_hours(5),
             false,
         )
         .await;
@@ -1068,7 +1067,7 @@ mod tests {
             "Backlog item",
             "o/r2",
             1,
-            Utc::now() - Duration::hours(10),
+            Timestamp::now() - Duration::from_hours(10),
             true,
         )
         .await;
@@ -1123,7 +1122,7 @@ mod tests {
             "Active PR",
             "o/r",
             1,
-            Utc::now() - Duration::hours(3),
+            Timestamp::now() - Duration::from_hours(3),
             false,
         )
         .await;
@@ -1134,7 +1133,7 @@ mod tests {
             "Dismissed PR",
             "o/r2",
             1,
-            Utc::now() - Duration::hours(3),
+            Timestamp::now() - Duration::from_hours(3),
             false,
         )
         .await;
@@ -1185,7 +1184,7 @@ mod tests {
             "<script>alert('xss')</script>",
             "o/r",
             1,
-            Utc::now() - Duration::hours(3),
+            Timestamp::now() - Duration::from_hours(3),
             false,
         )
         .await;
@@ -1233,7 +1232,7 @@ mod tests {
             "Test PR",
             "o/r",
             1,
-            Utc::now() - Duration::hours(3),
+            Timestamp::now() - Duration::from_hours(3),
             false,
         )
         .await;
@@ -1263,7 +1262,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         // Row untouched
-        let dismissed: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
+        let dismissed: Option<cja::jiff_sqlx::Timestamp> = sqlx::query_scalar!(
             "SELECT dismissed_at FROM pending_reviews WHERE id = $1",
             review_id
         )
@@ -1295,7 +1294,7 @@ mod tests {
             "Test PR",
             "o/r",
             1,
-            Utc::now() - Duration::hours(3),
+            Timestamp::now() - Duration::from_hours(3),
             false,
         )
         .await;
@@ -1312,7 +1311,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(location(&response), "/dashboard");
 
-        let dismissed: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
+        let dismissed: Option<cja::jiff_sqlx::Timestamp> = sqlx::query_scalar!(
             "SELECT dismissed_at FROM pending_reviews WHERE id = $1",
             review_id
         )
@@ -1349,7 +1348,7 @@ mod tests {
             user_b,
             state.crypto.encrypt("tok", user_b.as_bytes()).unwrap(),
             state.crypto.encrypt("ref", user_b.as_bytes()).unwrap(),
-            Utc::now() + Duration::days(30),
+            cja::jiff_sqlx::Timestamp::from(Timestamp::now() + Duration::from_hours(30 * 24)),
         )
         .execute(&db)
         .await
@@ -1362,7 +1361,7 @@ mod tests {
             "Other user PR",
             "o/r3",
             1,
-            Utc::now() - Duration::hours(3),
+            Timestamp::now() - Duration::from_hours(3),
             false,
         )
         .await;
@@ -1380,7 +1379,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
         // User B's row is untouched
-        let dismissed: Option<chrono::DateTime<Utc>> = sqlx::query_scalar!(
+        let dismissed: Option<cja::jiff_sqlx::Timestamp> = sqlx::query_scalar!(
             "SELECT dismissed_at FROM pending_reviews WHERE id = $1",
             review_b_id
         )
@@ -1687,7 +1686,7 @@ mod tests {
             user_id,
             state.crypto.encrypt("tok", user_id.as_bytes()).unwrap(),
             state.crypto.encrypt("ref", user_id.as_bytes()).unwrap(),
-            Utc::now() + Duration::days(30),
+            cja::jiff_sqlx::Timestamp::from(Timestamp::now() + Duration::from_hours(30 * 24)),
         )
         .execute(db)
         .await
