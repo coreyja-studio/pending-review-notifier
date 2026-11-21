@@ -16,13 +16,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse as _, Redirect, Response},
 };
-use chrono::Utc;
 use cja::jobs::Job as _;
 use cja::server::{
     cookies::{Cookie, CookieJar, SameSite},
     session::AppSession as _,
 };
 use color_eyre::eyre::eyre;
+use jiff::Timestamp;
 use rand::RngCore as _;
 use serde::Deserialize;
 use subtle::ConstantTimeEq as _;
@@ -134,7 +134,7 @@ async fn signed_in_response(
     let viewer = github::fetch_viewer(state, &tokens.access_token).await?;
     let email = github::fetch_primary_email(state, &tokens.access_token).await?;
 
-    let token_expires_at = Utc::now() + chrono::Duration::seconds(tokens.expires_in);
+    let token_expires_at = Timestamp::now() + jiff::SignedDuration::from_secs(tokens.expires_in);
 
     // Upsert by the rename-stable github_user_id. Token ciphertexts are
     // AAD-bound to the user_id, which for an existing user must be the row's
@@ -179,7 +179,7 @@ async fn signed_in_response(
             email,
             access_token_enc,
             refresh_token_enc,
-            token_expires_at,
+            cja::jiff_sqlx::Timestamp::from(token_expires_at),
             user_id,
         )
         .execute(&mut *tx)
@@ -198,7 +198,7 @@ async fn signed_in_response(
             viewer.database_id,
             access_token_enc,
             refresh_token_enc,
-            token_expires_at,
+            cja::jiff_sqlx::Timestamp::from(token_expires_at),
             email,
         )
         .execute(&mut *tx)
@@ -244,13 +244,7 @@ async fn signed_in_response(
     // ever writes cookies for the anonymous sessions it auto-creates.
     let session = PrnSession::create(&state.db).await?;
     session.set_user(&state.db, user_id).await?;
-    let session_cookie = Cookie::build(("session_id", session.session_id().to_string()))
-        .path("/")
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Lax)
-        .build();
-    jar.add(session_cookie);
+    cja::server::session::save_session_cookie(jar, *session.session_id());
 
     // Kick off an initial pending-review sync so the dashboard has data on the
     // user's first visit. Best-effort: a queue hiccup must not fail the login —
@@ -396,7 +390,9 @@ pub async fn ensure_fresh_token(state: &AppState, user_id: Uuid) -> cja::Result<
 
     // This read happened under the lock: if a concurrent caller refreshed
     // while we waited for it, the expiry is already fresh and we're done.
-    if row.token_expires_at > Utc::now() + chrono::Duration::minutes(5) {
+    if jiff::Timestamp::from(row.token_expires_at)
+        > Timestamp::now() + jiff::SignedDuration::from_mins(5)
+    {
         tx.commit().await?;
         return state
             .crypto
@@ -424,7 +420,8 @@ pub async fn ensure_fresh_token(state: &AppState, user_id: Uuid) -> cja::Result<
             let refresh_token_enc = state
                 .crypto
                 .encrypt(&pair.refresh_token, user_id.as_bytes())?;
-            let token_expires_at = Utc::now() + chrono::Duration::seconds(pair.expires_in);
+            let token_expires_at =
+                Timestamp::now() + jiff::SignedDuration::from_secs(pair.expires_in);
 
             // Refresh tokens rotate: persist BOTH new tokens in one UPDATE,
             // and do it before handing the new access token to the caller —
@@ -439,7 +436,7 @@ pub async fn ensure_fresh_token(state: &AppState, user_id: Uuid) -> cja::Result<
                  WHERE user_id = $4",
                 access_token_enc,
                 refresh_token_enc,
-                token_expires_at,
+                cja::jiff_sqlx::Timestamp::from(token_expires_at),
                 user_id
             )
             .execute(&mut *tx)
@@ -476,7 +473,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode, header},
     };
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use sqlx::PgPool;
     use tower::ServiceExt as _;
     use wiremock::{
@@ -648,7 +645,7 @@ mod tests {
         state: &AppState,
         access: &str,
         refresh: &str,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Uuid {
         // user_id is generated app-side so the token ciphertexts can be
         // AAD-bound to it, same as the real callback path.
@@ -662,7 +659,7 @@ mod tests {
             user_id,
             state.crypto.encrypt(access, user_id.as_bytes()).unwrap(),
             state.crypto.encrypt(refresh, user_id.as_bytes()).unwrap(),
-            expires_at
+            cja::jiff_sqlx::Timestamp::from(expires_at)
         )
         .execute(&state.db)
         .await
@@ -832,7 +829,10 @@ mod tests {
             state.crypto.decrypt(&user.refresh_token_enc, aad).unwrap(),
             "ghr_test_refresh"
         );
-        assert!(user.token_expires_at > Utc::now() + chrono::Duration::hours(7));
+        assert!(
+            jiff::Timestamp::from(user.token_expires_at)
+                > Timestamp::now() + jiff::SignedDuration::from_hours(7)
+        );
         // Nothing token-shaped may be stored in the clear.
         assert_ne!(user.access_token_enc, b"gho_test_access");
 
@@ -859,7 +859,7 @@ mod tests {
             .get_all(header::SET_COOKIE)
             .iter()
             .map(|v| v.to_str().unwrap())
-            .find(|c| c.starts_with("session_id="))
+            .find(|c| c.starts_with("__Host-session_id="))
             .expect("callback must set the session cookie");
         assert!(session_set_cookie.contains("SameSite=Lax"));
         assert!(session_set_cookie.contains("HttpOnly"));
@@ -937,7 +937,7 @@ mod tests {
         mount_installations(&mock, serde_json::json!([])).await;
         let app = test_app(&state);
 
-        let user_id = insert_user(&state, "old_access", "old_refresh", Utc::now()).await;
+        let user_id = insert_user(&state, "old_access", "old_refresh", Timestamp::now()).await;
         sqlx::query!(
             "UPDATE users SET status = 'needs_reauth' WHERE user_id = $1",
             user_id
@@ -976,7 +976,7 @@ mod tests {
             &state,
             "gho_still_fresh",
             "ghr_unused",
-            Utc::now() + chrono::Duration::hours(2),
+            Timestamp::now() + jiff::SignedDuration::from_hours(2),
         )
         .await;
 
@@ -1007,7 +1007,7 @@ mod tests {
             &state,
             "gho_old",
             "ghr_old",
-            Utc::now() - chrono::Duration::hours(1),
+            Timestamp::now() - jiff::SignedDuration::from_hours(1),
         )
         .await;
 
@@ -1033,7 +1033,10 @@ mod tests {
                 .unwrap(),
             "ghr_new"
         );
-        assert!(user.token_expires_at > Utc::now() + chrono::Duration::hours(7));
+        assert!(
+            jiff::Timestamp::from(user.token_expires_at)
+                > Timestamp::now() + jiff::SignedDuration::from_hours(7)
+        );
         assert_eq!(user.status, "active");
     }
 
@@ -1061,7 +1064,7 @@ mod tests {
             &state,
             "gho_old",
             "ghr_old",
-            Utc::now() - chrono::Duration::hours(1),
+            Timestamp::now() - jiff::SignedDuration::from_hours(1),
         )
         .await;
 
@@ -1098,7 +1101,7 @@ mod tests {
             &state,
             "gho_old",
             "ghr_old",
-            Utc::now() - chrono::Duration::hours(1),
+            Timestamp::now() - jiff::SignedDuration::from_hours(1),
         )
         .await;
 
@@ -1141,7 +1144,7 @@ mod tests {
             &state,
             "gho_old",
             "ghr_old",
-            Utc::now() - chrono::Duration::hours(1),
+            Timestamp::now() - jiff::SignedDuration::from_hours(1),
         )
         .await;
 

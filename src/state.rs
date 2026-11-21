@@ -137,6 +137,14 @@ impl cja::app_state::AppState for AppState {
     fn cookie_key(&self) -> &CookieKey {
         &self.cookie_key
     }
+
+    fn eyes_base_url(&self) -> Option<&str> {
+        Some(&self.config.base_url)
+    }
+
+    fn eyes_http_monitors(&self) -> Vec<cja::app_state::HttpMonitor> {
+        vec![cja::app_state::HttpMonitor::new("health", "/healthz")]
+    }
 }
 
 #[cfg(test)]

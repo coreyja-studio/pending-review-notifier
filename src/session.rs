@@ -5,6 +5,8 @@
 //! signed-in session; no row means anonymous). The mapping row also carries
 //! the per-session CSRF token and the sign-in timestamp used for expiry.
 
+use jiff::Timestamp;
+
 use axum::{
     extract::FromRequestParts,
     http::StatusCode,
@@ -29,12 +31,12 @@ pub struct PrnSession {
     pub csrf_token: Option<Vec<u8>>,
     /// When the user signed in (user_sessions.created_at); present iff
     /// `user_id` is.
-    pub signed_in_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub signed_in_at: Option<Timestamp>,
 }
 
 #[async_trait::async_trait]
 impl AppSession for PrnSession {
-    async fn from_db(pool: &PgPool, session_id: Uuid) -> cja::Result<Self> {
+    async fn from_db(pool: &PgPool, session_id: Uuid) -> cja::Result<Option<Self>> {
         let row = sqlx::query!(
             r#"
             SELECT s.session_id, s.created_at, s.updated_at,
@@ -47,19 +49,19 @@ impl AppSession for PrnSession {
             "#,
             session_id
         )
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(Self {
+        Ok(row.map(|row| Self {
             inner: CJASession {
                 session_id: row.session_id,
-                updated_at: row.updated_at,
-                created_at: row.created_at,
+                updated_at: row.updated_at.into(),
+                created_at: row.created_at.into(),
             },
             user_id: row.user_id,
             csrf_token: row.csrf_token,
-            signed_in_at: row.signed_in_at,
-        })
+            signed_in_at: row.signed_in_at.map(Into::into),
+        }))
     }
 
     async fn create(pool: &PgPool) -> cja::Result<Self> {
@@ -188,7 +190,9 @@ impl FromRequestParts<AppState> for CurrentUser {
         };
 
         // Expire (and reap) old sign-ins rather than letting them live forever.
-        if signed_in_at < chrono::Utc::now() - chrono::Duration::days(SESSION_MAX_AGE_DAYS) {
+        if signed_in_at
+            < Timestamp::now() - jiff::SignedDuration::from_hours(SESSION_MAX_AGE_DAYS * 24)
+        {
             if let Err(err) = session.clear_user(&state.db).await {
                 tracing::error!(?err, "Failed to reap an expired session mapping");
             }
@@ -214,5 +218,27 @@ impl FromRequestParts<AppState> for CurrentUser {
             github_login: row.github_login,
             csrf_token,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test]
+    async fn missing_session_is_none_and_database_errors_propagate(pool: PgPool) {
+        let missing = Uuid::new_v4();
+        assert!(PrnSession::from_db(&pool, missing).await.unwrap().is_none());
+
+        let created = PrnSession::create(&pool).await.unwrap();
+        let loaded = PrnSession::from_db(&pool, *created.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded.user_id.is_none());
+        assert!(loaded.signed_in_at.is_none());
+
+        pool.close().await;
+        assert!(PrnSession::from_db(&pool, missing).await.is_err());
     }
 }

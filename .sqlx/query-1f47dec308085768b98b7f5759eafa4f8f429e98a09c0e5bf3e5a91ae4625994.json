@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "csrf_token",
-        "type_info": "Bytea"
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "user_sessions",
+            "name": "csrf_token"
+          }
+        }
       }
     ],
     "parameters": {

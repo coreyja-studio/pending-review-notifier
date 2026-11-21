@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Result, WrapErr};
+use jiff::{SignedDuration as Duration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::{self, DiscoveredReview};
@@ -61,13 +61,13 @@ pub struct ReviewState {
     pub repo_name_with_owner: String,
     pub comment_count: i32,
     /// The staleness age basis (most recent comment, per discovery).
-    pub last_comment_at: DateTime<Utc>,
-    pub first_seen_at: DateTime<Utc>,
+    pub last_comment_at: Timestamp,
+    pub first_seen_at: Timestamp,
     /// The anti-flood flag: already stale the first time we ever saw it →
     /// shown but never actionable. Resolved by `discovery::resolve_backlog`.
     pub is_backlog: bool,
     /// Last time this review was reported actionable (the dedup stamp).
-    pub notified_at: Option<DateTime<Utc>>,
+    pub notified_at: Option<Timestamp>,
 }
 
 /// One review as classified by a sweep, ready for human or JSON output.
@@ -78,8 +78,8 @@ pub struct ReportItem {
     pub pr_title: String,
     pub repo_name_with_owner: String,
     pub comment_count: i32,
-    pub last_comment_at: DateTime<Utc>,
-    pub first_seen_at: DateTime<Utc>,
+    pub last_comment_at: Timestamp,
+    pub first_seen_at: Timestamp,
 }
 
 /// The result of one sweep. Each discovered review lands in exactly one list.
@@ -144,7 +144,7 @@ pub fn apply_sweep(
     state: &mut StateFile,
     discovered: &[DiscoveredReview],
     threshold_hours: i32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> SweepOutcome {
     let mut next = BTreeMap::new();
     let mut outcome = SweepOutcome::default();
@@ -183,7 +183,7 @@ pub fn apply_sweep(
             // Same three-way disjunction as the service: never alerted, a
             // comment landed after the last alert (new cycle), or the last
             // alert is past the re-nudge window.
-            at < entry.last_comment_at || at < now - Duration::days(NOTIFY_DEDUP_DAYS)
+            at < entry.last_comment_at || at < now - Duration::from_hours(NOTIFY_DEDUP_DAYS * 24)
         }) {
             entry.notified_at = Some(now);
             outcome.newly_actionable.push(item);
@@ -220,11 +220,11 @@ pub fn apply_sweep(
 mod tests {
     use super::*;
 
-    fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    fn ts(s: &str) -> Timestamp {
+        s.parse::<Timestamp>().unwrap()
     }
 
-    fn review(id: &str, last_comment_at: DateTime<Utc>) -> DiscoveredReview {
+    fn review(id: &str, last_comment_at: Timestamp) -> DiscoveredReview {
         DiscoveredReview {
             review_id: id.to_string(),
             pr_url: format!("https://github.com/o/r/pull/{id}"),
@@ -477,15 +477,24 @@ mod tests {
         let mut state = StateFile::default();
         apply_sweep(
             &mut state,
-            &[review("R1", ts("2026-07-15T11:00:00Z"))],
+            &[review("R1", ts("2026-07-15T11:00:00.240100Z"))],
             4,
             ts("2026-07-15T12:00:00Z"),
         );
         save(&state, &path).unwrap();
 
+        // Chrono wrote three or six fractional digits. The same instant must
+        // load under jiff, then save with jiff's compact precision.
+        let compact = std::fs::read_to_string(&path).unwrap();
+        assert!(compact.contains(".2401Z"));
+        assert!(!compact.contains(".240100Z"));
+        std::fs::write(&path, compact.replace(".2401Z", ".240100Z")).unwrap();
+
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.reviews, state.reviews);
         assert_eq!(loaded.version, 1);
+        save(&loaded, &path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains(".2401Z"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

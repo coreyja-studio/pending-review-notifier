@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "access_token_enc",
-        "type_info": "Bytea"
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "access_token_enc"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "refresh_token_enc",
-        "type_info": "Bytea"
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "refresh_token_enc"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "token_expires_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "token_expires_at"
+          }
+        }
       }
     ],
     "parameters": {

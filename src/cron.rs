@@ -17,8 +17,7 @@ const REMINDER_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Build the cron registry.
 ///
-/// The closures are deliberately infallible (`Result<(), Infallible>`): a cron
-/// closure that returns `Err` propagates up and crashes the whole app, so
+/// The closures are deliberately infallible (`Result<(), Infallible>`):
 /// [`sync_sweep`] and [`reminder_sweep`] handle every error internally
 /// (log-and-continue) and the wrappers can only ever return `Ok`.
 ///
@@ -113,26 +112,23 @@ async fn reminder_sweep(state: AppState) {
     tracing::info!(active_users = total, "ReminderSweep enqueued");
 }
 
+pub const TIMEZONE: jiff::tz::TimeZone = jiff::tz::TimeZone::UTC;
+
 pub async fn run_cron(
     app_state: AppState,
     registry: CronRegistry<AppState>,
     shutdown_token: CancellationToken,
 ) -> cja::Result<()> {
-    Worker::new_with_timezone(
-        app_state,
-        registry,
-        cja::chrono_tz::UTC,
-        Duration::from_secs(60),
-    )
-    .run(shutdown_token)
-    .await?;
+    Worker::new_with_timezone(app_state, registry, TIMEZONE, Duration::from_secs(60))
+        .run(shutdown_token)
+        .await;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, Utc};
+    use jiff::{SignedDuration as Duration, Timestamp};
     use sqlx::PgPool;
     use uuid::Uuid;
 
@@ -152,7 +148,7 @@ mod tests {
             github_user_id,
             state.crypto.encrypt("tok", user_id.as_bytes()).unwrap(),
             state.crypto.encrypt("ref", user_id.as_bytes()).unwrap(),
-            Utc::now() + Duration::days(30),
+            cja::jiff_sqlx::Timestamp::from(Timestamp::now() + Duration::from_hours(30 * 24)),
         )
         .execute(db)
         .await

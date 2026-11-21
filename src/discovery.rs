@@ -11,8 +11,8 @@
 //! backlog rule. Persistence (the `pending_reviews` table for the service, a
 //! JSON state file for the CLI) is the caller's job.
 
-use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Result, WrapErr, eyre};
+use jiff::{SignedDuration as Duration, Timestamp};
 use serde::Deserialize;
 
 /// Hard ceiling on total results, matching GitHub search's own 1000-result
@@ -61,13 +61,13 @@ pub struct DiscoveredReview {
     pub comment_count: i32,
     /// Staleness age basis: the most recent comment's timestamp, falling back
     /// to the review's own `createdAt` when the comment timestamp is missing.
-    pub last_comment_at: DateTime<Utc>,
+    pub last_comment_at: Timestamp,
 }
 
 /// A review is stale once its age basis is older than the user's threshold.
 #[must_use]
-pub fn is_stale(last_comment_at: DateTime<Utc>, threshold_hours: i32, now: DateTime<Utc>) -> bool {
-    now - last_comment_at > Duration::hours(i64::from(threshold_hours))
+pub fn is_stale(last_comment_at: Timestamp, threshold_hours: i32, now: Timestamp) -> bool {
+    now - last_comment_at > Duration::from_hours(i64::from(threshold_hours))
 }
 
 /// The anti-flood backlog rule (docs/DESIGN.md "The anti-flood rule").
@@ -262,7 +262,7 @@ struct ReviewConnection {
 struct ReviewNode {
     id: String,
     #[serde(rename = "createdAt")]
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     comments: CommentConnection,
 }
 
@@ -276,15 +276,15 @@ struct CommentConnection {
 #[derive(Deserialize)]
 struct CommentNode {
     #[serde(rename = "createdAt")]
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    fn ts(s: &str) -> Timestamp {
+        s.parse::<Timestamp>().unwrap()
     }
 
     fn parse_node(json: serde_json::Value) -> Vec<DiscoveredReview> {
@@ -303,6 +303,9 @@ mod tests {
         assert!(!is_stale(ts("2026-07-15T09:00:00Z"), 4, now));
         // Exactly at the threshold is not yet stale (strictly greater-than).
         assert!(!is_stale(ts("2026-07-15T08:00:00Z"), 4, now));
+        assert!(is_stale(ts("2026-07-15T07:59:59Z"), 4, now));
+        // RFC3339 offsets describe the same instant as Z.
+        assert_eq!(ts("2026-07-15T04:00:00-04:00"), ts("2026-07-15T08:00:00Z"));
     }
 
     #[test]
