@@ -90,7 +90,10 @@ jobs:
 
   deploy:
     name: Deploy
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # `docker` is skipped on push, and a job's implicit success() check fails
+    # when any upstream job (even transitively, past ready's always()) was
+    # skipped. Gate on ready's own result, or main pushes never deploy.
+    if: ${{ !cancelled() && needs.ready.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     needs: ready
     runs-on: ubuntu-latest
     concurrency: fly-deploy
